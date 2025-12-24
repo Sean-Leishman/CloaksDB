@@ -9,8 +9,18 @@ use std::marker::PhantomData;
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 enum NodeType {
-    INTERNAL,
-    LEAF,
+    INTERNAL = 0,
+    LEAF = 1,
+}
+
+impl From<u8> for NodeType {
+    fn from(value: u8) -> NodeType {
+        match value {
+            0 => NodeType::INTERNAL,
+            1 => NodeType::LEAF,
+            _ => panic!("Invalid node type"),
+        }
+    }
 }
 
 struct Header {
@@ -20,6 +30,37 @@ struct Header {
 struct PageManager {
     file: File,
     page_size: u64,
+}
+
+struct Slot {
+    offset: u16,
+    key_length: u16,
+    value_length: u16,
+}
+
+impl Slot {
+    const SIZE: usize = 6;
+
+    fn serialize(&self) -> [u8; Self::SIZE] {
+        let mut buffer = [0u8; Self::SIZE];
+        buffer[0..2].copy_from_slice(&self.offset.to_le_bytes());
+        buffer[2..4].copy_from_slice(&self.key_length.to_le_bytes());
+        buffer[4..6].copy_from_slice(&self.value_length.to_le_bytes());
+
+        buffer
+    }
+
+    fn deserialize(buffer: &[u8]) -> Self {
+        let offset = u16::from_le_bytes(buffer[0..2].try_into().unwrap());
+        let key_length = u16::from_le_bytes(buffer[2..4].try_into().unwrap());
+        let value_length = u16::from_le_bytes(buffer[4..6].try_into().unwrap());
+
+        Slot {
+            offset: offset,
+            key_length: key_length,
+            value_length: value_length,
+        }
+    }
 }
 
 impl PageManager {
@@ -51,6 +92,180 @@ impl PageManager {
         let mut buffer = vec![0u8; buffer_size];
         let bytes_read = self.file.read(&mut buffer)?;
         Ok((Box::new(buffer), bytes_read))
+    }
+}
+
+struct SlottedPage {
+    page_id: u64,
+    node_type: NodeType,
+    num_keys: u16,
+    free_space_offset: u16, // where free space starts
+    slots: Vec<Slot>,
+    pointers: Vec<u64>,
+    data: Vec<u8>,
+}
+
+impl SlottedPage {
+    const HEADER_SIZE: usize = 20;
+
+    fn new(page_id: u64, node_type: NodeType, page_size: usize) -> SlottedPage {
+        SlottedPage {
+            page_id,
+            node_type,
+            num_keys: 0,
+            free_space_offset: page_size as u16,
+            slots: Vec::new(),
+            pointers: Vec::new(),
+            data: vec![0; page_size],
+        }
+    }
+
+    fn serialize(&self, page_size: usize) -> Vec<u8> {
+        let mut buffer = vec![0u8; page_size];
+        let mut offset = 0;
+
+        // header
+        buffer[offset..offset + 8].copy_from_slice(&self.page_id.to_le_bytes());
+        offset += 8;
+
+        buffer[offset] = self.node_type as u8;
+        offset += 1;
+
+        buffer[offset..offset + 2].copy_from_slice(&self.num_keys.to_le_bytes());
+        offset += 2;
+
+        buffer[offset..offset + 2].copy_from_slice(&self.free_space_offset.to_le_bytes());
+        offset += 2;
+
+        // slots
+        self.slots.iter().for_each(|slot| {
+            buffer[offset..offset + Slot::SIZE].copy_from_slice(&slot.serialize());
+            offset += Slot::SIZE;
+        });
+
+        self.pointers.iter().for_each(|ptr| {
+            buffer[offset..offset + 8].copy_from_slice(&ptr.to_le_bytes());
+            offset += 8
+        });
+
+        // data
+        let data_start = self.free_space_offset as usize;
+        buffer[data_start..].copy_from_slice(&self.data[data_start..]);
+
+        buffer
+    }
+
+    fn deserialize(buffer: &[u8]) -> Self {
+        let mut offset = 0;
+
+        // header
+        let page_id = u64::from_le_bytes(buffer[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+
+        let node_type = NodeType::from(buffer[offset]);
+        offset += 1;
+
+        let num_keys = u16::from_le_bytes(buffer[offset..offset + 2].try_into().unwrap());
+        offset += 2;
+
+        let free_space_offset = u16::from_le_bytes(buffer[offset..offset + 2].try_into().unwrap());
+        offset += 2;
+
+        let mut slots = Vec::new();
+        for _ in 0..num_keys {
+            slots.push(Slot::deserialize(&buffer[offset..offset + Slot::SIZE]));
+            offset += Slot::SIZE;
+        }
+
+        let mut pointers = Vec::new();
+        let num_pointers = match node_type {
+            NodeType::LEAF => 0,
+            NodeType::INTERNAL => num_keys + 1,
+        };
+        for _ in 0..num_pointers {
+            pointers.push(u64::from_le_bytes(
+                buffer[offset..offset + 8].try_into().unwrap(),
+            ));
+            offset += 8;
+        }
+
+        SlottedPage {
+            page_id,
+            node_type,
+            num_keys,
+            free_space_offset,
+            slots,
+            pointers,
+            data: buffer.to_vec(),
+        }
+    }
+
+    fn from_page<K, V>(page: &Page<K, V>, page_size: usize) -> SlottedPage
+    where
+        K: Serialize,
+        V: Serialize,
+    {
+        let mut slotted = SlottedPage::new(page.page_id, page.node_type, page_size);
+        slotted.num_keys = page.keys.len() as u16;
+        slotted.pointers = page.pointers.clone();
+
+        page.keys
+            .iter()
+            .zip(page.values.iter())
+            .for_each(|(key, value)| {
+                let key_bytes = bincode::serialize(key).unwrap();
+                let value_bytes = bincode::serialize(value).unwrap();
+
+                let total_len = key_bytes.len() + value_bytes.len();
+                slotted.free_space_offset -= total_len as u16;
+                let data_offset = slotted.free_space_offset;
+
+                let mut offset = data_offset as usize;
+                slotted.data[offset..offset + key_bytes.len()].copy_from_slice(&key_bytes);
+                offset += key_bytes.len();
+                slotted.data[offset..offset + value_bytes.len()].copy_from_slice(&value_bytes);
+
+                slotted.slots.push(Slot {
+                    offset: data_offset as u16,
+                    key_length: key_bytes.len() as u16,
+                    value_length: value_bytes.len() as u16,
+                })
+            });
+
+        slotted
+    }
+
+    fn to_page<K, V>(&self, max_keys: usize) -> Page<K, V>
+    where
+        K: for<'de> Deserialize<'de>,
+        V: for<'de> Deserialize<'de>,
+    {
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+
+        self.slots.iter().for_each(|slot| {
+            let offset = slot.offset as usize;
+            let key_length = slot.key_length as usize;
+            let value_length = slot.value_length as usize;
+
+            let key: K = bincode::deserialize(&self.data[offset..offset + key_length]).unwrap();
+            let value: V = bincode::deserialize(
+                &self.data[offset + key_length..offset + key_length + value_length],
+            )
+            .unwrap();
+
+            keys.push(key);
+            values.push(value);
+        });
+
+        Page {
+            page_id: self.page_id,
+            node_type: self.node_type,
+            keys,
+            values,
+            pointers: self.pointers.clone(),
+            max_keys,
+        }
     }
 }
 
@@ -114,6 +329,16 @@ where
     fn is_overfull(&self) -> bool {
         return self.keys.len() > self.max_keys;
     }
+
+    fn serialize(&self, page_size: usize) -> Vec<u8> {
+        let slotted = SlottedPage::from_page(self, page_size);
+        slotted.serialize(page_size)
+    }
+
+    fn deserialize(buffer: &[u8], max_keys: usize) -> Self {
+        let slotted = SlottedPage::deserialize(buffer);
+        SlottedPage::to_page(&slotted, max_keys)
+    }
 }
 
 struct BTree<K, V> {
@@ -136,6 +361,7 @@ where
         };
 
         let root_node: Page<K, V> = Page::new(max_keys, NodeType::LEAF, &mut page_manager);
+        println!("Create btree root_node_id={}", root_node.page_id);
 
         let mut btree = BTree::<K, V> {
             header: Header { max_keys: 4 },
@@ -259,14 +485,14 @@ where
 
     fn write_node(&mut self, page: &Page<K, V>) -> Result<(), Box<dyn std::error::Error>> {
         println!("write_node page_id={} page={:?}", page.page_id, page);
-        let data = serialize(page)?;
+        let data = page.serialize(self.page_manager.page_size.try_into().unwrap());
         self.page_manager.write_page(page.page_id, &data)?;
         Ok(())
     }
 
     fn read_node(&mut self, page_id: u64) -> Result<Page<K, V>, Box<dyn std::error::Error>> {
         let (buffer, _) = self.page_manager.read_page(page_id)?;
-        let mut node: Page<K, V> = deserialize(&buffer)?;
+        let mut node: Page<K, V> = Page::deserialize(&buffer, self.header.max_keys);
         node.max_keys = self.header.max_keys;
 
         Ok(node)
