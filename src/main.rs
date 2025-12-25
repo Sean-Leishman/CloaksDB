@@ -1,11 +1,12 @@
-use bincode::{deserialize, serialize};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::cmp::PartialOrd;
 use std::fmt::Debug;
 use std::fs::File;
-use std::io::{Bytes, Read, Seek, Write};
+use std::io::{Read, Seek, Write};
 use std::marker::PhantomData;
+
+const VERSION: u16 = 0;
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 enum NodeType {
@@ -24,12 +25,47 @@ impl From<u8> for NodeType {
 }
 
 struct Header {
-    max_keys: usize,
+    magic_number: u16,
+    version: u16,
+    page_size: u64,
+    root_page_id: u64,
+    page_count: u64,
+}
+
+impl Header {
+    const SIZE: usize = 28;
+    fn serialize(&self) -> [u8; Self::SIZE] {
+        let mut buffer = [0u8; Self::SIZE];
+        buffer[0..2].copy_from_slice(&self.magic_number.to_le_bytes());
+        buffer[2..4].copy_from_slice(&self.version.to_le_bytes());
+        buffer[4..12].copy_from_slice(&self.page_size.to_le_bytes());
+        buffer[12..20].copy_from_slice(&self.root_page_id.to_le_bytes());
+        buffer[20..28].copy_from_slice(&self.page_count.to_le_bytes());
+
+        buffer
+    }
+
+    fn deserialize(buffer: &[u8]) -> Self {
+        let magic_number = u16::from_le_bytes(buffer[0..2].try_into().unwrap());
+        let version = u16::from_le_bytes(buffer[2..4].try_into().unwrap());
+        let page_size = u64::from_le_bytes(buffer[4..12].try_into().unwrap());
+        let root_page_id = u64::from_le_bytes(buffer[12..20].try_into().unwrap());
+        let page_count = u64::from_le_bytes(buffer[20..28].try_into().unwrap());
+
+        Header {
+            magic_number,
+            version,
+            page_size,
+            root_page_id,
+            page_count,
+        }
+    }
 }
 
 struct PageManager {
     file: File,
     page_size: u64,
+    header_size: u64,
 }
 
 struct Slot {
@@ -64,11 +100,30 @@ impl Slot {
 }
 
 impl PageManager {
+    fn new(file: File, page_size: u64, header_size: u64) -> Self {
+        let header_buffer = vec![0u8; header_size as usize];
+        file.try_clone().unwrap().write_all(&header_buffer).unwrap();
+
+        PageManager {
+            file,
+            page_size,
+            header_size,
+        }
+    }
+
+    fn from_pageid(&self, page_id: u64) -> u64 {
+        (page_id * self.page_size) + self.header_size
+    }
+
+    fn to_pageid(&self, byte_offset: u64) -> u64 {
+        (byte_offset - self.header_size) / self.page_size
+    }
+
     fn allocate_page(&mut self) -> Result<u64, std::io::Error> {
         self.file.seek(std::io::SeekFrom::End(0))?;
 
         let byte_offset = self.file.seek(std::io::SeekFrom::Current(0))?;
-        let page_id = byte_offset / self.page_size;
+        let page_id = self.to_pageid(byte_offset);
 
         self.file
             .write(&vec![0u8; self.page_size.try_into().unwrap()])?;
@@ -76,9 +131,15 @@ impl PageManager {
         return Ok(page_id);
     }
 
+    fn write_header(&mut self, data: &[u8]) -> Result<(), std::io::Error> {
+        self.file.seek(std::io::SeekFrom::Start(0))?;
+        self.file.write_all(data)?;
+        Ok(())
+    }
+
     fn write_page(&mut self, page_id: u64, data: &[u8]) -> Result<(), std::io::Error> {
         self.file
-            .seek(std::io::SeekFrom::Start(page_id * self.page_size))?;
+            .seek(std::io::SeekFrom::Start(self.from_pageid(page_id)))?;
 
         self.file.write_all(data)?;
         Ok(())
@@ -86,9 +147,9 @@ impl PageManager {
 
     fn read_page(&mut self, page_id: u64) -> Result<(Box<Vec<u8>>, usize), std::io::Error> {
         self.file
-            .seek(std::io::SeekFrom::Start(page_id * self.page_size))?;
+            .seek(std::io::SeekFrom::Start(self.from_pageid(page_id)))?;
 
-        let buffer_size: usize = (page_id * self.page_size).try_into().unwrap();
+        let buffer_size: usize = self.page_size.try_into().unwrap();
         let mut buffer = vec![0u8; buffer_size];
         let bytes_read = self.file.read(&mut buffer)?;
         Ok((Box::new(buffer), bytes_read))
@@ -106,7 +167,7 @@ struct SlottedPage {
 }
 
 impl SlottedPage {
-    const HEADER_SIZE: usize = 20;
+    const HEADER_SIZE: usize = 13;
 
     fn new(page_id: u64, node_type: NodeType, page_size: usize) -> SlottedPage {
         SlottedPage {
@@ -118,6 +179,24 @@ impl SlottedPage {
             pointers: Vec::new(),
             data: vec![0; page_size],
         }
+    }
+
+    fn get_free_space(&self, page_size: usize) -> usize {
+        let used_at_start =
+            Self::HEADER_SIZE + (self.slots.len() * Slot::SIZE) + (self.pointers.len() * 8);
+        let used_at_end = page_size - self.free_space_offset as usize;
+        page_size.saturating_sub(used_at_start + used_at_end)
+    }
+
+    fn can_insert(&self, key_len: usize, value_len: usize, page_size: usize) -> bool {
+        let needed = Slot::SIZE + key_len + value_len;
+        let needed = match self.node_type {
+            NodeType::LEAF => needed,
+            NodeType::INTERNAL => needed + 8, // child pointer
+        };
+
+        let free_space = self.get_free_space(page_size);
+        free_space >= needed
     }
 
     fn serialize(&self, page_size: usize) -> Vec<u8> {
@@ -137,7 +216,6 @@ impl SlottedPage {
         buffer[offset..offset + 2].copy_from_slice(&self.free_space_offset.to_le_bytes());
         offset += 2;
 
-        // slots
         self.slots.iter().for_each(|slot| {
             buffer[offset..offset + Slot::SIZE].copy_from_slice(&slot.serialize());
             offset += Slot::SIZE;
@@ -150,6 +228,13 @@ impl SlottedPage {
 
         // data
         let data_start = self.free_space_offset as usize;
+        if data_start < offset {
+            panic!(
+                "free space is not enough: {:?} {} {}",
+                self.page_id, offset, data_start
+            );
+        }
+
         buffer[data_start..].copy_from_slice(&self.data[data_start..]);
 
         buffer
@@ -235,7 +320,7 @@ impl SlottedPage {
         slotted
     }
 
-    fn to_page<K, V>(&self, max_keys: usize) -> Page<K, V>
+    fn to_page<K, V>(&self) -> Page<K, V>
     where
         K: for<'de> Deserialize<'de>,
         V: for<'de> Deserialize<'de>,
@@ -264,7 +349,6 @@ impl SlottedPage {
             keys,
             values,
             pointers: self.pointers.clone(),
-            max_keys,
         }
     }
 }
@@ -276,9 +360,6 @@ struct Page<K, V> {
     keys: Vec<K>,
     values: Vec<V>,
     pointers: Vec<u64>,
-
-    #[serde(skip_serializing)]
-    max_keys: usize,
 }
 
 impl<K, V> Page<K, V>
@@ -286,7 +367,7 @@ where
     K: Clone + PartialOrd + Debug + Serialize + for<'de> Deserialize<'de>,
     V: Clone + Debug + Serialize + for<'de> Deserialize<'de>,
 {
-    fn new(max_keys: usize, node_type: NodeType, page_manager: &mut PageManager) -> Page<K, V> {
+    fn new(node_type: NodeType, page_manager: &mut PageManager) -> Page<K, V> {
         let page_id = page_manager.allocate_page().unwrap();
         Page {
             page_id: page_id,
@@ -294,7 +375,6 @@ where
             keys: vec![],
             values: vec![],
             pointers: vec![],
-            max_keys: max_keys,
         }
     }
 
@@ -322,12 +402,12 @@ where
         self.pointers.insert(pos + 1, new_node_id);
     }
 
-    fn is_full(&self) -> bool {
-        return self.keys.len() == self.max_keys;
-    }
+    fn can_insert_variable(&self, key: &K, value: &V, page_size: usize) -> bool {
+        let key_bytes = bincode::serialize(key).unwrap();
+        let value_bytes = bincode::serialize(value).unwrap();
 
-    fn is_overfull(&self) -> bool {
-        return self.keys.len() > self.max_keys;
+        let slotted = SlottedPage::from_page(self, page_size);
+        slotted.can_insert(key_bytes.len(), value_bytes.len(), page_size)
     }
 
     fn serialize(&self, page_size: usize) -> Vec<u8> {
@@ -335,16 +415,15 @@ where
         slotted.serialize(page_size)
     }
 
-    fn deserialize(buffer: &[u8], max_keys: usize) -> Self {
+    fn deserialize(buffer: &[u8]) -> Self {
         let slotted = SlottedPage::deserialize(buffer);
-        SlottedPage::to_page(&slotted, max_keys)
+        SlottedPage::to_page(&slotted)
     }
 }
 
 struct BTree<K, V> {
     header: Header,
     page_manager: PageManager,
-    root_page_id: u64,
 
     _phantom: PhantomData<(K, V)>,
 }
@@ -354,46 +433,63 @@ where
     K: Clone + PartialOrd + Debug + Serialize + for<'de> Deserialize<'de>,
     V: Clone + Debug + Serialize + for<'de> Deserialize<'de>,
 {
-    fn new(file: File, max_keys: usize) -> BTree<K, V> {
-        let mut page_manager = PageManager {
-            file: file,
-            page_size: 4 * 1024,
-        };
+    fn new(file: File, page_size: u64) -> BTree<K, V> {
+        let mut page_manager = PageManager::new(file, page_size, Header::SIZE as u64);
 
-        let root_node: Page<K, V> = Page::new(max_keys, NodeType::LEAF, &mut page_manager);
-        println!("Create btree root_node_id={}", root_node.page_id);
+        let root_node: Page<K, V> = Page::new(NodeType::LEAF, &mut page_manager);
 
         let mut btree = BTree::<K, V> {
-            header: Header { max_keys: 4 },
+            header: Header {
+                magic_number: 0,
+                version: VERSION,
+                page_size: page_size,
+                root_page_id: root_node.page_id,
+                page_count: 1,
+            },
             page_manager: page_manager,
-            root_page_id: root_node.page_id,
             _phantom: PhantomData,
         };
+        let _ = btree.write_header();
         let _ = btree.write_node(&root_node);
 
         return btree;
     }
 
+    fn search(&mut self, key: K) -> Result<V, Box<dyn std::error::Error>> {
+        self.search_node(key, self.header.root_page_id)
+    }
+
+    fn search_node(&mut self, key: K, page_id: u64) -> Result<V, Box<dyn std::error::Error>> {
+        let node = self.read_node(page_id)?;
+        let pos = node.find_key_position(&key);
+        if pos < node.keys.len() && node.keys[pos] == key {
+            return Ok(node.values[pos].clone());
+        }
+
+        match node.node_type {
+            NodeType::INTERNAL => {
+                let child_node_id = node.pointers[pos];
+                self.search_node(key, child_node_id)
+            }
+            NodeType::LEAF => panic!("Key {:?} not found", key),
+        }
+    }
+
     fn insert(&mut self, key: K, value: V) -> Result<(), Box<dyn std::error::Error>> {
-        let mut root = self.read_node(self.root_page_id)?;
+        let mut root = self.read_node(self.header.root_page_id)?;
 
-        self.insert_non_full(&mut root, key, value)?;
-        if root.is_full() {
-            let mut new_root: Page<K, V> = Page::new(
-                self.header.max_keys,
-                NodeType::INTERNAL,
-                &mut self.page_manager,
-            );
-            new_root.pointers.push(self.root_page_id);
-
-            let (promoted_key, promoted_value, right_node) = self.split_child(&mut root);
+        if let Some((promoted_key, promoted_value, right_node)) =
+            self.insert_non_full(&mut root, key.clone(), value.clone())?
+        {
+            let mut new_root: Page<K, V> = Page::new(NodeType::INTERNAL, &mut self.page_manager);
+            new_root.pointers.push(self.header.root_page_id);
 
             new_root.keys.push(promoted_key);
             new_root.values.push(promoted_value);
             new_root.pointers.push(right_node.page_id);
 
             self.write_node(&new_root)?;
-            self.root_page_id = new_root.page_id;
+            self.header.root_page_id = new_root.page_id;
 
             return Ok(());
         }
@@ -412,13 +508,12 @@ where
                 NodeType::LEAF => {
                     // If leaf is overflowing, it should be split
                     // Parent should point to current node AND a new node
-                    node.insert_key_value(key, value);
-                    if node.is_overfull() {
-                        let split_child_result = self.split_child(node);
-                        Ok(Some(split_child_result))
-                    } else {
+                    node.insert_key_value(key.clone(), value.clone());
+                    if node.can_insert_variable(&key, &value, self.header.page_size as usize) {
                         self.write_node(node)?;
                         Ok(None)
+                    } else {
+                        Ok(Some(self.split_child(node)))
                     }
                 }
                 NodeType::INTERNAL => {
@@ -432,23 +527,23 @@ where
                     if let Some((promoted_key, promoted_value, new_right)) =
                         self.insert_non_full(&mut child, key, value)?
                     {
-                        println!(
-                            "Overflow with: key={:?} node={:?} child={:?}",
-                            promoted_key, node, child
-                        );
                         let pos = node.find_key_position(&promoted_key);
                         node.insert_key_value_node(
                             pos,
-                            promoted_key,
-                            promoted_value,
+                            promoted_key.clone(),
+                            promoted_value.clone(),
                             new_right.page_id,
                         );
 
-                        if node.is_overfull() {
-                            Ok(Some(self.split_child(node)))
-                        } else {
+                        if node.can_insert_variable(
+                            &promoted_key,
+                            &promoted_value,
+                            self.header.page_size as usize,
+                        ) {
                             self.write_node(node).unwrap();
                             Ok(None)
+                        } else {
+                            Ok(Some(self.split_child(node)))
                         }
                     } else {
                         Ok(None)
@@ -467,7 +562,7 @@ where
         let mid_key = node.keys[mid_index].clone();
         let mid_value = node.values[mid_index].clone();
 
-        let mut right_node = Page::new(node.max_keys, node.node_type, &mut self.page_manager);
+        let mut right_node = Page::new(node.node_type, &mut self.page_manager);
         right_node.keys = node.keys.split_off(mid_index + 1);
         right_node.values = node.values.split_off(mid_index + 1);
         right_node.pointers = match node.node_type {
@@ -483,8 +578,13 @@ where
         (mid_key, mid_value, right_node)
     }
 
+    fn write_header(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let buffer = self.header.serialize();
+        self.page_manager.write_header(&buffer)?;
+        Ok(())
+    }
+
     fn write_node(&mut self, page: &Page<K, V>) -> Result<(), Box<dyn std::error::Error>> {
-        println!("write_node page_id={} page={:?}", page.page_id, page);
         let data = page.serialize(self.page_manager.page_size.try_into().unwrap());
         self.page_manager.write_page(page.page_id, &data)?;
         Ok(())
@@ -492,8 +592,7 @@ where
 
     fn read_node(&mut self, page_id: u64) -> Result<Page<K, V>, Box<dyn std::error::Error>> {
         let (buffer, _) = self.page_manager.read_page(page_id)?;
-        let mut node: Page<K, V> = Page::deserialize(&buffer, self.header.max_keys);
-        node.max_keys = self.header.max_keys;
+        let node: Page<K, V> = Page::deserialize(&buffer);
 
         Ok(node)
     }
@@ -527,8 +626,8 @@ where
     }
 
     fn print_tree(&mut self) {
-        println!("BTREE: {}", self.root_page_id);
-        self.print(self.root_page_id, 0, 0);
+        println!("BTREE: {}", self.header.root_page_id);
+        self.print(self.header.root_page_id, 0, 0);
         println!("\n")
     }
 }
@@ -545,14 +644,16 @@ fn main() {
         .open(&index_filename)
         .expect("Failed to open file");
 
-    let mut btree = BTree::<i64, i64>::new(file, 4);
+    let mut btree = BTree::<i64, i64>::new(file, 256);
     let mut rng = rand::rng();
 
     for i in 0..100 {
-        let num: i64 = rng.random_range(0..101); // Generate a number in the range [0, 100]
+        let _: i64 = rng.random_range(0..101); // Generate a number in the range [0, 100]
         btree.insert(i, 100).unwrap();
         btree.print_tree();
     }
     btree.print_tree();
-    println!("Finished run")
+    println!("Finished run");
+
+    println!("Search (key={}): {}", 20, btree.search(20).unwrap());
 }
