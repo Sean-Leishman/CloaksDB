@@ -1,6 +1,7 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::cmp::PartialOrd;
+use std::error::Error;
 use std::fmt::Debug;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
@@ -24,6 +25,7 @@ impl From<u8> for NodeType {
     }
 }
 
+#[derive(Debug)]
 struct Header {
     magic_number: u16,
     version: u16,
@@ -31,6 +33,31 @@ struct Header {
     root_page_id: u64,
     page_count: u64,
 }
+
+#[derive(Debug)]
+enum HeaderError {
+    InvalidMagicNumber(u16),
+    InvalidBufferSize { expected: usize, got: usize },
+    CorruptedData(String),
+}
+
+impl std::fmt::Display for HeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            HeaderError::InvalidMagicNumber(num) => {
+                write!(f, "Invalid magic number: {} (must be > 0)", num)
+            }
+            HeaderError::InvalidBufferSize { expected, got } => {
+                write!(f, "Invalid buffer size: expected {}, got {}", expected, got)
+            }
+            HeaderError::CorruptedData(msg) => {
+                write!(f, "Corrupted header data: {}", msg)
+            }
+        }
+    }
+}
+
+impl Error for HeaderError {}
 
 impl Header {
     const SIZE: usize = 28;
@@ -45,20 +72,24 @@ impl Header {
         buffer
     }
 
-    fn deserialize(buffer: &[u8]) -> Self {
+    fn deserialize(buffer: &[u8]) -> Result<Self, HeaderError> {
         let magic_number = u16::from_le_bytes(buffer[0..2].try_into().unwrap());
+        if magic_number == 0 {
+            return Err(HeaderError::InvalidMagicNumber(magic_number));
+        }
+
         let version = u16::from_le_bytes(buffer[2..4].try_into().unwrap());
         let page_size = u64::from_le_bytes(buffer[4..12].try_into().unwrap());
         let root_page_id = u64::from_le_bytes(buffer[12..20].try_into().unwrap());
         let page_count = u64::from_le_bytes(buffer[20..28].try_into().unwrap());
 
-        Header {
+        Ok(Header {
             magic_number,
             version,
             page_size,
             root_page_id,
             page_count,
-        }
+        })
     }
 }
 
@@ -101,8 +132,12 @@ impl Slot {
 
 impl PageManager {
     fn new(file: File, page_size: u64, header_size: u64) -> Self {
-        let header_buffer = vec![0u8; header_size as usize];
-        file.try_clone().unwrap().write_all(&header_buffer).unwrap();
+        let mut file_clone = file.try_clone().unwrap();
+        let file_length = file_clone.seek(std::io::SeekFrom::End(0)).unwrap();
+        if file_length < header_size {
+            let header_buffer = vec![0u8; header_size as usize];
+            file_clone.write_all(&header_buffer).unwrap();
+        }
 
         PageManager {
             file,
@@ -123,6 +158,14 @@ impl PageManager {
         self.file.seek(std::io::SeekFrom::End(0))?;
 
         let byte_offset = self.file.seek(std::io::SeekFrom::Current(0))?;
+        if byte_offset < Header::SIZE as u64 {
+            panic!(
+                "Must write header prior to allocating pages: {} < {}",
+                byte_offset,
+                Header::SIZE
+            );
+        }
+
         let page_id = self.to_pageid(byte_offset);
 
         self.file
@@ -132,9 +175,29 @@ impl PageManager {
     }
 
     fn write_header(&mut self, data: &[u8]) -> Result<(), std::io::Error> {
-        self.file.seek(std::io::SeekFrom::Start(0))?;
+        if data.len() > self.header_size as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Buffer too large: expected {} got {}",
+                    self.header_size,
+                    data.len()
+                ),
+            ));
+        }
+
+        let byte_offset = self.file.seek(std::io::SeekFrom::Start(0))?;
+        println!("write_header: {:?} {}", data, byte_offset);
         self.file.write_all(data)?;
         Ok(())
+    }
+
+    fn read_header(&mut self) -> Result<Vec<u8>, std::io::Error> {
+        let mut buffer = vec![0u8; self.header_size as usize];
+        let byte_offset = self.file.seek(std::io::SeekFrom::Start(0))?;
+        self.file.read(&mut buffer)?;
+        println!("read_header: {:?} {}", buffer, byte_offset);
+        Ok(buffer)
     }
 
     fn write_page(&mut self, page_id: u64, data: &[u8]) -> Result<(), std::io::Error> {
@@ -290,6 +353,7 @@ impl SlottedPage {
         K: Serialize,
         V: Serialize,
     {
+        println!("from_page: {:?}", page.page_id);
         let mut slotted = SlottedPage::new(page.page_id, page.node_type, page_size);
         slotted.num_keys = page.keys.len() as u16;
         slotted.pointers = page.pointers.clone();
@@ -302,7 +366,8 @@ impl SlottedPage {
                 let value_bytes = bincode::serialize(value).unwrap();
 
                 let total_len = key_bytes.len() + value_bytes.len();
-                slotted.free_space_offset -= total_len as u16;
+                slotted.free_space_offset =
+                    slotted.free_space_offset.saturating_sub(total_len as u16);
                 let data_offset = slotted.free_space_offset;
 
                 let mut offset = data_offset as usize;
@@ -435,24 +500,66 @@ where
 {
     fn new(file: File, page_size: u64) -> BTree<K, V> {
         let mut page_manager = PageManager::new(file, page_size, Header::SIZE as u64);
+        let mut header = match Self::read_header(&mut page_manager) {
+            Ok(header) => header,
+            Err(e) => {
+                eprintln!("error from read_header: {:?}", e);
+                Header {
+                    magic_number: 1,
+                    version: VERSION,
+                    page_size: page_size,
+                    root_page_id: 0,
+                    page_count: 0,
+                }
+            }
+        };
+        println!("Header: {:?}", header);
 
-        let root_node: Page<K, V> = Page::new(NodeType::LEAF, &mut page_manager);
+        if header.page_count == 0 {
+            // Called when header is initialised above or if, for some reason, the header is
+            // created without a root page
 
-        let mut btree = BTree::<K, V> {
-            header: Header {
-                magic_number: 0,
-                version: VERSION,
-                page_size: page_size,
-                root_page_id: root_node.page_id,
-                page_count: 1,
-            },
+            println!("Header created");
+            let root_node = Self::create_page(&mut header, NodeType::LEAF, &mut page_manager);
+            header.page_count += 1;
+            header.root_page_id = root_node.page_id;
+
+            let mut btree = BTree::<K, V> {
+                header: header,
+                page_manager: page_manager,
+                _phantom: PhantomData,
+            };
+
+            BTree::<K, V>::write_header(&mut btree.header, &mut btree.page_manager).unwrap();
+            BTree::<K, V>::write_node(&root_node, &mut btree.page_manager).unwrap();
+
+            Self::read_header(&mut btree.page_manager).unwrap();
+
+            return btree;
+        }
+
+        let btree = BTree::<K, V> {
+            header: header,
             page_manager: page_manager,
             _phantom: PhantomData,
         };
-        let _ = btree.write_header();
-        let _ = btree.write_node(&root_node);
+        btree
+    }
 
-        return btree;
+    fn read_header(page_manager: &mut PageManager) -> Result<Header, Box<dyn std::error::Error>> {
+        let buffer = page_manager.read_header()?;
+        Ok(Header::deserialize(&buffer)?)
+    }
+
+    fn create_page(
+        header: &mut Header,
+        node_type: NodeType,
+        page_manager: &mut PageManager,
+    ) -> Page<K, V> {
+        header.page_count += 1;
+        Self::write_header(header, page_manager).unwrap();
+
+        Page::new(node_type, page_manager)
     }
 
     fn search(&mut self, key: K) -> Result<V, Box<dyn std::error::Error>> {
@@ -481,14 +588,15 @@ where
         if let Some((promoted_key, promoted_value, right_node)) =
             self.insert_non_full(&mut root, key.clone(), value.clone())?
         {
-            let mut new_root: Page<K, V> = Page::new(NodeType::INTERNAL, &mut self.page_manager);
+            let mut new_root =
+                Self::create_page(&mut self.header, NodeType::INTERNAL, &mut self.page_manager);
             new_root.pointers.push(self.header.root_page_id);
 
             new_root.keys.push(promoted_key);
             new_root.values.push(promoted_value);
             new_root.pointers.push(right_node.page_id);
 
-            self.write_node(&new_root)?;
+            BTree::<K, V>::write_node(&new_root, &mut self.page_manager)?;
             self.header.root_page_id = new_root.page_id;
 
             return Ok(());
@@ -510,7 +618,7 @@ where
                     // Parent should point to current node AND a new node
                     node.insert_key_value(key.clone(), value.clone());
                     if node.can_insert_variable(&key, &value, self.header.page_size as usize) {
-                        self.write_node(node)?;
+                        BTree::<K, V>::write_node(node, &mut self.page_manager)?;
                         Ok(None)
                     } else {
                         Ok(Some(self.split_child(node)))
@@ -540,7 +648,7 @@ where
                             &promoted_value,
                             self.header.page_size as usize,
                         ) {
-                            self.write_node(node).unwrap();
+                            BTree::<K, V>::write_node(node, &mut self.page_manager).unwrap();
                             Ok(None)
                         } else {
                             Ok(Some(self.split_child(node)))
@@ -562,7 +670,8 @@ where
         let mid_key = node.keys[mid_index].clone();
         let mid_value = node.values[mid_index].clone();
 
-        let mut right_node = Page::new(node.node_type, &mut self.page_manager);
+        let mut right_node =
+            Self::create_page(&mut self.header, node.node_type, &mut self.page_manager);
         right_node.keys = node.keys.split_off(mid_index + 1);
         right_node.values = node.values.split_off(mid_index + 1);
         right_node.pointers = match node.node_type {
@@ -572,21 +681,27 @@ where
         node.keys.pop();
         node.values.pop();
 
-        self.write_node(&node).unwrap();
-        self.write_node(&right_node).unwrap();
+        BTree::<K, V>::write_node(&node, &mut self.page_manager).unwrap();
+        BTree::<K, V>::write_node(&right_node, &mut self.page_manager).unwrap();
 
         (mid_key, mid_value, right_node)
     }
 
-    fn write_header(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let buffer = self.header.serialize();
-        self.page_manager.write_header(&buffer)?;
+    fn write_header(
+        header: &mut Header,
+        page_manager: &mut PageManager,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let buffer = header.serialize();
+        page_manager.write_header(&buffer)?;
         Ok(())
     }
 
-    fn write_node(&mut self, page: &Page<K, V>) -> Result<(), Box<dyn std::error::Error>> {
-        let data = page.serialize(self.page_manager.page_size.try_into().unwrap());
-        self.page_manager.write_page(page.page_id, &data)?;
+    fn write_node(
+        page: &Page<K, V>,
+        page_manager: &mut PageManager,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let data = page.serialize(page_manager.page_size.try_into().unwrap());
+        page_manager.write_page(page.page_id, &data)?;
         Ok(())
     }
 
@@ -641,13 +756,14 @@ fn main() {
         .create(true)
         .write(true)
         .read(true)
+        .truncate(false)
         .open(&index_filename)
         .expect("Failed to open file");
 
     let mut btree = BTree::<i64, i64>::new(file, 256);
     let mut rng = rand::rng();
 
-    for i in 0..100 {
+    for i in 400..500 {
         let _: i64 = rng.random_range(0..101); // Generate a number in the range [0, 100]
         btree.insert(i, 100).unwrap();
         btree.print_tree();
@@ -655,5 +771,6 @@ fn main() {
     btree.print_tree();
     println!("Finished run");
 
-    println!("Search (key={}): {}", 20, btree.search(20).unwrap());
+    btree.print_tree();
+    println!("Search (key={}): {}", 500, btree.search(500).unwrap());
 }
