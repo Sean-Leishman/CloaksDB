@@ -41,6 +41,62 @@ enum HeaderError {
     CorruptedData(String),
 }
 
+#[derive(Debug)]
+enum PageManagerError {
+    Io(std::io::Error),
+    HeaderNotWritten,
+}
+
+#[derive(Debug)]
+enum SlottedPageError {
+    Io(std::io::Error),
+    Serialization(bincode::Error),
+    InvalidBufferSize { expected: usize, got: usize },
+}
+
+#[derive(Debug)]
+enum BTreeError {
+    Io(std::io::Error),
+    Serialization(bincode::Error),
+    Header(HeaderError),
+    PageManager(PageManagerError),
+    SlottedPage(SlottedPageError),
+    KeyNotFound(String),
+    InvalidNodeType(u8),
+    PageOverflow { page_id: u64 },
+}
+
+impl std::fmt::Display for BTreeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            BTreeError::Io(e) => {
+                write!(f, "IO error: {}", e)
+            }
+            BTreeError::Serialization(e) => {
+                write!(f, "Serialization error: {}", e)
+            }
+            BTreeError::Header(e) => {
+                write!(f, "Header error: {}", e)
+            }
+            BTreeError::PageManager(e) => {
+                write!(f, "PageManager error: {}", e)
+            }
+            BTreeError::SlottedPage(e) => {
+                write!(f, "SlottedPage error: {}", e)
+            }
+            BTreeError::KeyNotFound(key) => {
+                write!(f, "KeyNotFound: {}", key)
+            }
+            BTreeError::InvalidNodeType(node_type) => {
+                write!(f, "InvalidNodeType: {}", node_type)
+            }
+            BTreeError::PageOverflow { page_id } => {
+                write!(f, "PageOverflow: page_id={}", page_id)
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for HeaderError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
@@ -57,7 +113,60 @@ impl std::fmt::Display for HeaderError {
     }
 }
 
+impl std::fmt::Display for PageManagerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            PageManagerError::Io(e) => {
+                write!(f, "IO error: {}", e)
+            }
+            PageManagerError::HeaderNotWritten {} => {
+                write!(f, "Header has not been written")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for SlottedPageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            SlottedPageError::Io(e) => {
+                write!(f, "IO error: {}", e)
+            }
+            SlottedPageError::Serialization(e) => {
+                write!(f, "Serialization error: {}", e)
+            }
+            SlottedPageError::InvalidBufferSize { expected, got } => {
+                write!(f, "Invalid buffer size: expected {}, got {}", expected, got)
+            }
+        }
+    }
+}
+
 impl Error for HeaderError {}
+
+impl From<std::io::Error> for BTreeError {
+    fn from(err: std::io::Error) -> BTreeError {
+        BTreeError::Io(err)
+    }
+}
+
+impl From<std::io::Error> for PageManagerError {
+    fn from(err: std::io::Error) -> PageManagerError {
+        PageManagerError::Io(err)
+    }
+}
+
+impl From<std::io::Error> for SlottedPageError {
+    fn from(err: std::io::Error) -> SlottedPageError {
+        SlottedPageError::Io(err)
+    }
+}
+
+impl From<SlottedPageError> for BTreeError {
+    fn from(err: SlottedPageError) -> BTreeError {
+        BTreeError::SlottedPage(err)
+    }
+}
 
 impl Header {
     const SIZE: usize = 28;
@@ -154,16 +263,12 @@ impl PageManager {
         (byte_offset - self.header_size) / self.page_size
     }
 
-    fn allocate_page(&mut self) -> Result<u64, std::io::Error> {
+    fn allocate_page(&mut self) -> Result<u64, PageManagerError> {
         self.file.seek(std::io::SeekFrom::End(0))?;
 
         let byte_offset = self.file.seek(std::io::SeekFrom::Current(0))?;
         if byte_offset < Header::SIZE as u64 {
-            panic!(
-                "Must write header prior to allocating pages: {} < {}",
-                byte_offset,
-                Header::SIZE
-            );
+            return Err(PageManagerError::HeaderNotWritten);
         }
 
         let page_id = self.to_pageid(byte_offset);
@@ -262,7 +367,7 @@ impl SlottedPage {
         free_space >= needed
     }
 
-    fn serialize(&self, page_size: usize) -> Vec<u8> {
+    fn serialize(&self, page_size: usize) -> Result<Vec<u8>, SlottedPageError> {
         let mut buffer = vec![0u8; page_size];
         let mut offset = 0;
 
@@ -292,15 +397,15 @@ impl SlottedPage {
         // data
         let data_start = self.free_space_offset as usize;
         if data_start < offset {
-            panic!(
-                "free space is not enough: {:?} {} {}",
-                self.page_id, offset, data_start
-            );
+            return Err(SlottedPageError::InvalidBufferSize {
+                expected: offset,
+                got: data_start,
+            });
         }
 
         buffer[data_start..].copy_from_slice(&self.data[data_start..]);
 
-        buffer
+        Ok(buffer)
     }
 
     fn deserialize(buffer: &[u8]) -> Self {
@@ -475,9 +580,9 @@ where
         slotted.can_insert(key_bytes.len(), value_bytes.len(), page_size)
     }
 
-    fn serialize(&self, page_size: usize) -> Vec<u8> {
+    fn serialize(&self, page_size: usize) -> Result<Vec<u8>, BTreeError> {
         let slotted = SlottedPage::from_page(self, page_size);
-        slotted.serialize(page_size)
+        Ok(slotted.serialize(page_size)?)
     }
 
     fn deserialize(buffer: &[u8]) -> Self {
@@ -562,11 +667,11 @@ where
         Page::new(node_type, page_manager)
     }
 
-    fn search(&mut self, key: K) -> Result<V, Box<dyn std::error::Error>> {
+    fn search(&mut self, key: K) -> Result<V, BTreeError> {
         self.search_node(key, self.header.root_page_id)
     }
 
-    fn search_node(&mut self, key: K, page_id: u64) -> Result<V, Box<dyn std::error::Error>> {
+    fn search_node(&mut self, key: K, page_id: u64) -> Result<V, BTreeError> {
         let node = self.read_node(page_id)?;
         let pos = node.find_key_position(&key);
         if pos < node.keys.len() && node.keys[pos] == key {
@@ -578,11 +683,11 @@ where
                 let child_node_id = node.pointers[pos];
                 self.search_node(key, child_node_id)
             }
-            NodeType::LEAF => panic!("Key {:?} not found", key),
+            NodeType::LEAF => Err(BTreeError::KeyNotFound(format!("{:?}", key))),
         }
     }
 
-    fn insert(&mut self, key: K, value: V) -> Result<(), Box<dyn std::error::Error>> {
+    fn insert(&mut self, key: K, value: V) -> Result<(), BTreeError> {
         let mut root = self.read_node(self.header.root_page_id)?;
 
         if let Some((promoted_key, promoted_value, right_node)) =
@@ -610,54 +715,53 @@ where
         node: &mut Page<K, V>,
         key: K,
         value: V,
-    ) -> Result<Option<(K, V, Page<K, V>)>, Box<dyn std::error::Error>> {
-        let result: Result<Option<(K, V, Page<K, V>)>, Box<dyn std::error::Error>> =
-            match node.node_type {
-                NodeType::LEAF => {
-                    // If leaf is overflowing, it should be split
-                    // Parent should point to current node AND a new node
-                    node.insert_key_value(key.clone(), value.clone());
-                    if node.can_insert_variable(&key, &value, self.header.page_size as usize) {
-                        BTree::<K, V>::write_node(node, &mut self.page_manager)?;
+    ) -> Result<Option<(K, V, Page<K, V>)>, BTreeError> {
+        let result: Result<Option<(K, V, Page<K, V>)>, BTreeError> = match node.node_type {
+            NodeType::LEAF => {
+                // If leaf is overflowing, it should be split
+                // Parent should point to current node AND a new node
+                node.insert_key_value(key.clone(), value.clone());
+                if node.can_insert_variable(&key, &value, self.header.page_size as usize) {
+                    BTree::<K, V>::write_node(node, &mut self.page_manager)?;
+                    Ok(None)
+                } else {
+                    Ok(Some(self.split_child(node)))
+                }
+            }
+            NodeType::INTERNAL => {
+                let child_pos = node.find_key_position(&key);
+                let mut child = self.read_node(node.pointers[child_pos])?;
+
+                // In internal node, insert key into child
+                // The child can be split and therefore, the extra key is promoted and has to be
+                // inserted into the parent
+                // The parent can then be split in turn
+                if let Some((promoted_key, promoted_value, new_right)) =
+                    self.insert_non_full(&mut child, key, value)?
+                {
+                    let pos = node.find_key_position(&promoted_key);
+                    node.insert_key_value_node(
+                        pos,
+                        promoted_key.clone(),
+                        promoted_value.clone(),
+                        new_right.page_id,
+                    );
+
+                    if node.can_insert_variable(
+                        &promoted_key,
+                        &promoted_value,
+                        self.header.page_size as usize,
+                    ) {
+                        BTree::<K, V>::write_node(node, &mut self.page_manager).unwrap();
                         Ok(None)
                     } else {
                         Ok(Some(self.split_child(node)))
                     }
+                } else {
+                    Ok(None)
                 }
-                NodeType::INTERNAL => {
-                    let child_pos = node.find_key_position(&key);
-                    let mut child = self.read_node(node.pointers[child_pos])?;
-
-                    // In internal node, insert key into child
-                    // The child can be split and therefore, the extra key is promoted and has to be
-                    // inserted into the parent
-                    // The parent can then be split in turn
-                    if let Some((promoted_key, promoted_value, new_right)) =
-                        self.insert_non_full(&mut child, key, value)?
-                    {
-                        let pos = node.find_key_position(&promoted_key);
-                        node.insert_key_value_node(
-                            pos,
-                            promoted_key.clone(),
-                            promoted_value.clone(),
-                            new_right.page_id,
-                        );
-
-                        if node.can_insert_variable(
-                            &promoted_key,
-                            &promoted_value,
-                            self.header.page_size as usize,
-                        ) {
-                            BTree::<K, V>::write_node(node, &mut self.page_manager).unwrap();
-                            Ok(None)
-                        } else {
-                            Ok(Some(self.split_child(node)))
-                        }
-                    } else {
-                        Ok(None)
-                    }
-                }
-            };
+            }
+        };
 
         match result? {
             Some((key, value, node)) => Ok(Some((key, value, node))),
@@ -687,25 +791,19 @@ where
         (mid_key, mid_value, right_node)
     }
 
-    fn write_header(
-        header: &mut Header,
-        page_manager: &mut PageManager,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn write_header(header: &mut Header, page_manager: &mut PageManager) -> Result<(), BTreeError> {
         let buffer = header.serialize();
         page_manager.write_header(&buffer)?;
         Ok(())
     }
 
-    fn write_node(
-        page: &Page<K, V>,
-        page_manager: &mut PageManager,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let data = page.serialize(page_manager.page_size.try_into().unwrap());
+    fn write_node(page: &Page<K, V>, page_manager: &mut PageManager) -> Result<(), BTreeError> {
+        let data = page.serialize(page_manager.page_size.try_into().unwrap())?;
         page_manager.write_page(page.page_id, &data)?;
         Ok(())
     }
 
-    fn read_node(&mut self, page_id: u64) -> Result<Page<K, V>, Box<dyn std::error::Error>> {
+    fn read_node(&mut self, page_id: u64) -> Result<Page<K, V>, BTreeError> {
         let (buffer, _) = self.page_manager.read_page(page_id)?;
         let node: Page<K, V> = Page::deserialize(&buffer);
 
