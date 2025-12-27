@@ -62,3 +62,15 @@ impl From<HeaderError> for BTreeError {
         BTreeError::Header(err)
     }
 }
+
+impl From<PageManagerError> for BTreeError {
+    fn from(err: PageManagerError) -> BTreeError {
+        BTreeError::PageManager(err)
+    }
+}
+
+impl From<bincode::Error> for BTreeError {
+    fn from(err: bincode::Error) -> BTreeError {
+        BTreeError::Serialization(err)
+    }
+}

@@ -19,12 +19,18 @@ fn main() {
 
     for i in 400..500 {
         let _: i64 = rng.random_range(0..101); // Generate a number in the range [0, 100]
-        btree.insert(i, 100).unwrap();
+        match btree.insert(i, 100) {
+            Ok(_) => println!("Insert {} success", i),
+            Err(e) => {
+                eprintln!("Insert {} failed: {:?}", i, e);
+                panic!("Insert failed")
+            }
+        }
         btree.print_tree();
     }
     btree.print_tree();
     println!("Finished run");
 
-    btree.print_tree();
+    // btree.print_tree();
     println!("Search (key={}): {}", 500, btree.search(500).unwrap());
 }

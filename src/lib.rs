@@ -1,7 +1,6 @@
 pub mod error;
 pub mod header;
 
-pub mod page;
 pub mod page_manager;
 
 pub mod slot;

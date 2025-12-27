@@ -1,7 +1,10 @@
-use crate::page::Page;
+use std::{io::Write, marker::PhantomData};
+
+use crate::error::BTreeError;
 use crate::slot::Slot;
 use crate::types::NodeType;
 use serde::{Deserialize, Serialize};
+use std::fmt::Debug;
 
 #[derive(Debug)]
 pub enum SlottedPageError {
@@ -31,20 +34,27 @@ impl From<std::io::Error> for SlottedPageError {
     }
 }
 
-pub struct SlottedPage {
-    page_id: u64,
-    node_type: NodeType,
+pub struct SlottedPage<K, V> {
+    pub page_id: u64,
+    pub node_type: NodeType,
     num_keys: u16,
     free_space_offset: u16, // where free space starts
     slots: Vec<Slot>,
-    pointers: Vec<u64>,
+    pub pointers: Vec<u64>,
     data: Vec<u8>,
+
+    _phantom_data: PhantomData<(K, V)>,
 }
 
-impl SlottedPage {
+impl<K, V> SlottedPage<K, V>
+where
+    K: PartialOrd + Debug + PartialEq + Serialize + for<'de> Deserialize<'de>,
+    V: Debug + Serialize + for<'de> Deserialize<'de>,
+{
     const HEADER_SIZE: usize = 13;
 
-    fn new(page_id: u64, node_type: NodeType, page_size: usize) -> SlottedPage {
+    pub fn new(page_id: u64, node_type: NodeType, page_size: usize) -> Self {
+        println!("SlottedPage::new: {}", page_size);
         SlottedPage {
             page_id,
             node_type,
@@ -53,6 +63,7 @@ impl SlottedPage {
             slots: Vec::new(),
             pointers: Vec::new(),
             data: vec![0; page_size],
+            _phantom_data: PhantomData,
         }
     }
 
@@ -60,10 +71,17 @@ impl SlottedPage {
         let used_at_start =
             Self::HEADER_SIZE + (self.slots.len() * Slot::SIZE) + (self.pointers.len() * 8);
         let used_at_end = page_size - self.free_space_offset as usize;
+        println!(
+            "get_free_space ({}): {} - ({} + {})",
+            self.page_id, page_size, used_at_start, used_at_end
+        );
         page_size.saturating_sub(used_at_start + used_at_end)
     }
 
-    pub fn can_insert(&self, key_len: usize, value_len: usize, page_size: usize) -> bool {
+    pub fn can_insert(&self, key: &K, value: &V, page_size: usize) -> bool {
+        let key_len = bincode::serialize(key).unwrap().len();
+        let value_len = bincode::serialize(value).unwrap().len();
+
         let needed = Slot::SIZE + key_len + value_len;
         let needed = match self.node_type {
             NodeType::LEAF => needed,
@@ -71,6 +89,10 @@ impl SlottedPage {
         };
 
         let free_space = self.get_free_space(page_size);
+        println!(
+            "can_insert ({}): {} >= {}",
+            self.page_id, free_space, needed
+        );
         free_space >= needed
     }
 
@@ -107,6 +129,12 @@ impl SlottedPage {
             return Err(SlottedPageError::InvalidBufferSize {
                 expected: offset,
                 got: data_start,
+            });
+        }
+        if self.data.len() != buffer.len() {
+            return Err(SlottedPageError::InvalidBufferSize {
+                expected: buffer.len(),
+                got: self.data.len(),
             });
         }
 
@@ -157,75 +185,230 @@ impl SlottedPage {
             slots,
             pointers,
             data: buffer.to_vec(),
+            _phantom_data: PhantomData,
         }
     }
 
-    pub fn from_page<K, V>(page: &Page<K, V>, page_size: usize) -> SlottedPage
+    pub fn find_exact_key(&self, key: &K) -> Result<usize, BTreeError> {
+        let pos = self.find_key_position(key)?;
+        if pos < self.slots.len() {
+            let found_key: K = self.read_key(pos)?;
+            if &found_key == key {
+                return Ok(pos);
+            }
+        }
+        Err(BTreeError::KeyNotFound("".to_string()))
+    }
+
+    pub fn find_key_position(&self, key: &K) -> Result<usize, BTreeError>
     where
-        K: Serialize,
-        V: Serialize,
+        K: PartialOrd + for<'de> Deserialize<'de>,
     {
-        println!("from_page: {:?}", page.page_id);
-        let mut slotted = SlottedPage::new(page.page_id, page.node_type, page_size);
-        slotted.num_keys = page.keys.len() as u16;
-        slotted.pointers = page.pointers.clone();
+        let mut left = 0;
+        let mut right = self.slots.len();
 
-        page.keys
-            .iter()
-            .zip(page.values.iter())
-            .for_each(|(key, value)| {
-                let key_bytes = bincode::serialize(key).unwrap();
-                let value_bytes = bincode::serialize(value).unwrap();
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let mid_key: K = self.read_key(mid)?;
 
-                let total_len = key_bytes.len() + value_bytes.len();
-                slotted.free_space_offset =
-                    slotted.free_space_offset.saturating_sub(total_len as u16);
-                let data_offset = slotted.free_space_offset;
+            if key <= &mid_key {
+                right = mid;
+            } else {
+                left = mid + 1;
+            }
+        }
 
-                let mut offset = data_offset as usize;
-                slotted.data[offset..offset + key_bytes.len()].copy_from_slice(&key_bytes);
-                offset += key_bytes.len();
-                slotted.data[offset..offset + value_bytes.len()].copy_from_slice(&value_bytes);
+        Ok(left)
+    }
 
-                slotted.slots.push(Slot {
-                    offset: data_offset as u16,
-                    key_length: key_bytes.len() as u16,
-                    value_length: value_bytes.len() as u16,
-                })
+    pub fn get_pointer(&self, key: &K) -> Result<u64, BTreeError> {
+        let pos = self.find_key_position(&key)?;
+        Ok(self.pointers[pos])
+    }
+
+    pub fn insert(&mut self, pos: usize, key: &K, value: &V) -> Result<(), BTreeError> {
+        let key_bytes = bincode::serialize(key)?;
+        let key_bytes_len = key_bytes.len();
+
+        let value_bytes = bincode::serialize(value)?;
+        let value_bytes_len = value_bytes.len();
+
+        if !self.can_insert(key, value, 256) {
+            println!("insert failed ({}): {:?}", self.page_id, key);
+            return Err(BTreeError::PageOverflow {
+                page_id: self.page_id,
             });
+        }
 
-        slotted
+        let total_len = key_bytes_len + value_bytes_len;
+        let new_offset = self.free_space_offset as usize - total_len;
+
+        self.data[new_offset..new_offset + key_bytes_len].copy_from_slice(&key_bytes);
+        self.data[new_offset + key_bytes_len..new_offset + total_len].copy_from_slice(&value_bytes);
+        self.free_space_offset = new_offset as u16;
+
+        let slot = Slot {
+            offset: new_offset as u16,
+            key_length: key_bytes_len as u16,
+            value_length: value_bytes_len as u16,
+        };
+        self.slots.insert(pos, slot);
+        self.num_keys += 1;
+
+        Ok(())
     }
 
-    pub fn to_page<K, V>(&self) -> Page<K, V>
-    where
-        K: for<'de> Deserialize<'de>,
-        V: for<'de> Deserialize<'de>,
-    {
-        let mut keys = Vec::new();
-        let mut values = Vec::new();
+    pub fn update(&mut self, pos: usize, key: &K, value: &V) -> Result<(), BTreeError> {
+        let key_bytes = bincode::serialize(key)?;
+        let key_bytes_len = key_bytes.len();
 
-        self.slots.iter().for_each(|slot| {
-            let offset = slot.offset as usize;
-            let key_length = slot.key_length as usize;
-            let value_length = slot.value_length as usize;
+        let value_bytes = bincode::serialize(value)?;
+        let value_bytes_len = value_bytes.len();
 
-            let key: K = bincode::deserialize(&self.data[offset..offset + key_length]).unwrap();
-            let value: V = bincode::deserialize(
-                &self.data[offset + key_length..offset + key_length + value_length],
-            )
-            .unwrap();
+        let slot: &Slot = &self.slots[pos];
+        let offset = slot.offset as usize;
+        let old_value_bytes_len = slot.value_length as usize;
 
-            keys.push(key);
-            values.push(value);
-        });
+        if value_bytes_len <= old_value_bytes_len {
+            self.data[offset..offset + key_bytes_len].copy_from_slice(&key_bytes);
+            self.data[offset + key_bytes_len..offset + key_bytes_len + value_bytes_len]
+                .copy_from_slice(&value_bytes);
 
-        Page {
-            page_id: self.page_id,
-            node_type: self.node_type,
-            keys,
-            values,
-            pointers: self.pointers.clone(),
+            self.slots[pos].key_length = key_bytes_len as u16;
+            self.slots[pos].value_length = value_bytes_len as u16;
+            Ok(())
+        } else {
+            let total_len = key_bytes_len + value_bytes_len;
+            if self.get_free_space(256) < total_len {
+                println!("her1");
+                return Err(BTreeError::PageOverflow {
+                    page_id: self.page_id,
+                });
+            }
+
+            let new_offset = self.free_space_offset as usize - total_len;
+            self.data[new_offset..new_offset + key_bytes_len].copy_from_slice(&key_bytes);
+            self.data[new_offset + key_bytes_len..new_offset + total_len]
+                .copy_from_slice(&value_bytes);
+
+            self.free_space_offset = new_offset as u16;
+
+            self.slots[pos] = Slot {
+                offset: new_offset as u16,
+                key_length: key_bytes_len as u16,
+                value_length: value_bytes_len as u16,
+            };
+
+            Ok(())
         }
+    }
+
+    pub fn split(&mut self, new_page_id: u64) -> Result<(K, V, SlottedPage<K, V>), BTreeError> {
+        let mid_index: usize = self.num_keys as usize / 2;
+        let mid_key = self.read_key(mid_index)?;
+        let mid_value = self.read_value(mid_index)?;
+
+        let mut right = SlottedPage::new(new_page_id, self.node_type, 256);
+        for i in (mid_index + 1)..self.slots.len() {
+            let key: K = self.read_key(i)?;
+            let value: V = self.read_value(i)?;
+            right.insert(right.slots.len(), &key, &value)?;
+        }
+
+        if self.node_type == NodeType::INTERNAL && self.pointers.len() > mid_index + 1 {
+            right.pointers = self.pointers.split_off(mid_index + 1);
+        }
+
+        self.slots.truncate(mid_index);
+        self.compact()?;
+        self.num_keys = mid_index as u16;
+
+        Ok((mid_key, mid_value, right))
+    }
+
+    pub fn compact(&mut self) -> Result<(), BTreeError> {
+        let mut pairs: Vec<(K, V)> = Vec::with_capacity(self.slots.len());
+        for idx in 0..self.slots.len() {
+            pairs.push(self.read_key_value(idx)?);
+        }
+
+        self.free_space_offset = 256;
+        self.slots.clear();
+
+        for (key, value) in pairs.iter() {
+            let key_bytes = bincode::serialize(key)?;
+            let value_bytes = bincode::serialize(value)?;
+
+            let total_len = key_bytes.len() + value_bytes.len();
+            let new_offset: usize = self.free_space_offset as usize - total_len;
+
+            self.data[new_offset..new_offset + key_bytes.len()].copy_from_slice(&key_bytes);
+            self.data[new_offset + key_bytes.len()..new_offset + total_len]
+                .copy_from_slice(&value_bytes);
+
+            self.free_space_offset = new_offset as u16;
+
+            self.slots.push(Slot {
+                offset: self.free_space_offset,
+                key_length: key_bytes.len() as u16,
+                value_length: value_bytes.len() as u16,
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn read_key_value(&self, index: usize) -> Result<(K, V), BTreeError> {
+        let slot = &self.slots[index];
+        let offset = slot.offset as usize;
+        let key_length = slot.key_length as usize;
+        let key: K = bincode::deserialize(&self.data[offset..offset + key_length])?;
+
+        let offset = offset + key_length;
+        let value_length = slot.value_length as usize;
+        let value: V = bincode::deserialize(&self.data[offset..offset + value_length])?;
+
+        Ok((key, value))
+    }
+
+    pub fn read_key(&self, index: usize) -> Result<K, BTreeError> {
+        let slot = &self.slots[index];
+        let offset = slot.offset as usize;
+        let key_length = slot.key_length as usize;
+        let key: K = bincode::deserialize(&self.data[offset..offset + key_length])?;
+        Ok(key)
+    }
+
+    pub fn read_value(&self, index: usize) -> Result<V, BTreeError> {
+        let slot = &self.slots[index];
+        let key_length = slot.key_length as usize;
+        let value_length = slot.value_length as usize;
+        let offset = slot.offset as usize + key_length;
+
+        let value: V = bincode::deserialize(&self.data[offset..offset + value_length])?;
+        Ok(value)
+    }
+
+    pub fn read_keys(&self) -> Result<Vec<K>, BTreeError> {
+        (0..self.num_keys)
+            .map(|idx| self.read_key(idx.into()))
+            .collect::<Result<Vec<K>, BTreeError>>()
+    }
+}
+
+impl<K, V> std::fmt::Debug for SlottedPage<K, V>
+where
+    K: PartialOrd + Debug + PartialEq + Serialize + for<'de> Deserialize<'de>,
+    V: Debug + Serialize + for<'de> Deserialize<'de>,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlottedPage")
+            .field("page_id", &self.page_id)
+            .field("num_keys", &self.num_keys)
+            .field("slots", &self.slots)
+            .field("pointers", &self.pointers)
+            .field("data_len", &self.data.len()) // Don't print all bytes
+            .field("keys", &self.read_keys().unwrap())
+            .finish()
     }
 }

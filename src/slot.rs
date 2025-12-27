@@ -1,3 +1,6 @@
+use std::fmt::Debug;
+
+#[derive(Debug)]
 pub struct Slot {
     pub offset: u16,
     pub key_length: u16,
