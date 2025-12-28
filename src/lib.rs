@@ -1,4 +1,5 @@
 pub mod error;
+pub mod free_space;
 pub mod header;
 
 pub mod page_manager;

@@ -14,10 +14,10 @@ fn main() {
         .open(&index_filename)
         .expect("Failed to open file");
 
-    let mut btree = BTree::<i64, i64>::new(file, 256);
+    let mut btree = BTree::<i64, i64>::new(file, 1024);
     let mut rng = rand::rng();
 
-    for i in 400..500 {
+    for i in 400..1000 {
         let _: i64 = rng.random_range(0..101); // Generate a number in the range [0, 100]
         match btree.insert(i, 100) {
             Ok(_) => println!("Insert {} success", i),

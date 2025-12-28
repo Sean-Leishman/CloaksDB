@@ -112,12 +112,12 @@ where
             new_root.pointers.push(right.page_id);
 
             BTree::<K, V>::write_page(&new_root, &mut self.page_manager)?;
-
             self.header.root_page_id = new_root.page_id;
 
             return Ok(());
         }
 
+        BTree::<K, V>::write_header(&self.header, &mut self.page_manager)?;
         Ok(())
     }
 
@@ -254,7 +254,7 @@ where
         }
     }
 
-    fn write_header(header: &mut Header, page_manager: &mut PageManager) -> Result<(), BTreeError> {
+    fn write_header(header: &Header, page_manager: &mut PageManager) -> Result<(), BTreeError> {
         let buffer = header.serialize();
         page_manager.write_header(&buffer)?;
         Ok(())
@@ -295,7 +295,16 @@ where
             true => "",
         };
 
-        let stringified_keys = format!("{:?}", node.read_keys().unwrap());
+        let keys = node.read_keys().unwrap();
+        let stringified_keys = match keys.len() <= 5 {
+            true => format!("{:?}", keys),
+            false => {
+                let start = &keys[..2];
+                let end = &keys[keys.len() - 2..];
+                format!("{:?},...,{:?}", start, end)
+            }
+        };
+
         println!(
             "{}{}{}{}",
             " ".repeat(chars_prior),
