@@ -37,8 +37,8 @@ where
             // created without a root page
 
             println!("Header created");
-            let root_node = Self::create_page(&mut header, NodeType::LEAF, &mut page_manager);
-            header.add_root_node(root_node.page_id);
+            let root_page = Self::create_page(&mut header, NodeType::LEAF, &mut page_manager);
+            header.add_root_page(root_page.page_id);
 
             let mut btree = BTree::<K, V> {
                 header: header,
@@ -47,7 +47,7 @@ where
             };
 
             BTree::<K, V>::write_header(&mut btree.header, &mut btree.page_manager).unwrap();
-            BTree::<K, V>::write_node(&root_node, &mut btree.page_manager).unwrap();
+            BTree::<K, V>::write_page(&root_page, &mut btree.page_manager).unwrap();
 
             Self::read_header(&mut btree.page_manager).unwrap();
 
@@ -84,7 +84,7 @@ where
     }
 
     fn search_node(&mut self, key: K, page_id: u64) -> Result<V, BTreeError> {
-        let node = self.read_node(page_id)?;
+        let node = self.read_page(page_id)?;
         match node.node_type {
             NodeType::INTERNAL => {
                 let child_node_id = node.get_pointer(&key)?;
@@ -95,30 +95,23 @@ where
     }
 
     pub fn insert(&mut self, key: K, value: V) -> Result<(), BTreeError> {
-        let mut root = self.read_node(self.header.root_page_id)?;
+        let mut root = self.read_page(self.header.root_page_id)?;
 
-        if let Some((promoted_key, promoted_value, right_node)) =
-            self.insert_non_full(&mut root, key.clone(), value.clone())?
+        if let Some((promoted_key, promoted_value, right)) =
+            self.insert_into_page(&mut root, key.clone(), value.clone())?
         {
             println!(
                 "full root: promoted_key={:?} \n\tnode={:?} \n\tright_node={:?}",
-                promoted_key, root, right_node
+                promoted_key, root, right
             );
             let mut new_root =
                 Self::create_page(&mut self.header, NodeType::INTERNAL, &mut self.page_manager);
 
             new_root.insert(0, &promoted_key, &promoted_value)?;
             new_root.pointers.push(self.header.root_page_id);
-            new_root.pointers.push(right_node.page_id);
-            // new_root.pointers.push(self.header.root_page_id);
-            //
-            // new_root.keys.push(promoted_key);
-            // new_root.values.push(promoted_value);
-            // new_root.pointers.push(right_node.page_id);
+            new_root.pointers.push(right.page_id);
 
-            BTree::<K, V>::write_node(&new_root, &mut self.page_manager)?;
-            BTree::<K, V>::write_node(&right_node, &mut self.page_manager)?;
-            BTree::<K, V>::write_node(&root, &mut self.page_manager)?;
+            BTree::<K, V>::write_page(&new_root, &mut self.page_manager)?;
 
             self.header.root_page_id = new_root.page_id;
 
@@ -128,38 +121,38 @@ where
         Ok(())
     }
 
-    fn insert_non_full(
+    fn insert_into_page(
         &mut self,
-        node: &mut SlottedPage<K, V>,
+        page: &mut SlottedPage<K, V>,
         key: K,
         value: V,
     ) -> Result<Option<(K, V, SlottedPage<K, V>)>, BTreeError> {
-        let result: Result<Option<(K, V, SlottedPage<K, V>)>, BTreeError> = match node.node_type {
+        let result: Result<Option<(K, V, SlottedPage<K, V>)>, BTreeError> = match page.node_type {
             NodeType::LEAF => {
                 // If leaf is overflowing, it should be split
                 // Parent should point to current node AND a new node
-                match node.find_exact_key(&key) {
+                match page.find_exact_key(&key) {
                     Ok(pos) => {
-                        node.update(pos, &key, &value)?;
-                        BTree::<K, V>::write_node(node, &mut self.page_manager)?;
+                        page.update(pos, &key, &value)?;
+                        BTree::<K, V>::write_page(page, &mut self.page_manager)?;
                         Ok(None)
                     }
                     Err(_) => {
-                        if node.can_insert(&key, &value, self.header.page_size as usize) {
+                        if page.can_insert(&key, &value, self.header.page_size as usize) {
                             println!("insert: LEAF and can_insert");
-                            let pos = node.find_key_position(&key)?;
-                            node.insert(pos, &key, &value)?;
-                            BTree::<K, V>::write_node(node, &mut self.page_manager)?;
+                            let pos = page.find_key_position(&key)?;
+                            page.insert(pos, &key, &value)?;
+                            BTree::<K, V>::write_page(page, &mut self.page_manager)?;
                             Ok(None)
                         } else {
                             println!("insert: LEAF and not can_insert");
                             let new_page_id = self.page_manager.allocate_page()?;
-                            let (promoted_key, promoted_value, mut right_node) =
-                                node.split(new_page_id)?;
+                            let (promoted_key, promoted_value, mut right) =
+                                page.split(new_page_id)?;
 
                             println!(
                                 "insert: promoted_key={:?}\nright_node={:?}\nnode={:?}",
-                                promoted_key, right_node, node
+                                promoted_key, right, page
                             );
 
                             if key < promoted_key {
@@ -167,11 +160,11 @@ where
                                     "insert: into first node promoted_key={:?} key={:?}",
                                     promoted_key, key
                                 );
-                                let pos = node.find_key_position(&key)?;
-                                node.insert(pos, &key, &value)?;
+                                let pos = page.find_key_position(&key)?;
+                                page.insert(pos, &key, &value)?;
                             } else if promoted_key < key {
-                                let pos = right_node.find_key_position(&key)?;
-                                right_node.insert(pos, &key, &value)?;
+                                let pos = right.find_key_position(&key)?;
+                                right.insert(pos, &key, &value)?;
                                 println!(
                                     "insert: into second node promoted_key={:?} key={:?}",
                                     promoted_key, key
@@ -180,62 +173,74 @@ where
                                 panic!("Weird");
                             }
 
-                            println!("insert: write node={:?}", node);
-                            println!("insert: write right_node={:?}", right_node);
-                            BTree::<K, V>::write_node(node, &mut self.page_manager)?;
-                            BTree::<K, V>::write_node(&right_node, &mut self.page_manager)?;
+                            println!("insert: write node={:?}", page);
+                            println!("insert: write right_node={:?}", right);
+                            BTree::<K, V>::write_page(page, &mut self.page_manager)?;
+                            BTree::<K, V>::write_page(&right, &mut self.page_manager)?;
 
                             self.header.add_page();
-                            Ok(Some((promoted_key, promoted_value, right_node)))
+                            Ok(Some((promoted_key, promoted_value, right)))
                         }
                     }
                 }
             }
             NodeType::INTERNAL => {
-                // let child_pos = node.find_key_position(&k/*  */ey);
-                let mut child = self.read_node(node.get_pointer(&key)?)?;
+                let mut child = self.read_page(page.get_pointer(&key)?)?;
 
                 // In internal node, insert key into child
                 // The child can be split and therefore, the extra key is promoted and has to be
                 // inserted into the parent
                 // The parent can then be split in turn
-                match self.insert_non_full(&mut child, key.clone(), value.clone())? {
-                    Some((promoted_key, promoted_value, right_node)) => {
-                        let insert_pos = node.find_key_position(&promoted_key)?;
+                match self.insert_into_page(&mut child, key.clone(), value.clone())? {
+                    Some((child_promoted_key, child_promoted_value, child_right)) => {
+                        let insert_pos = page.find_key_position(&child_promoted_key)?;
                         println!("insert: INTERNAL and split");
-                        if node.can_insert(
-                            &promoted_key,
-                            &promoted_value,
+                        if page.can_insert(
+                            &child_promoted_key,
+                            &child_promoted_value,
                             self.header.page_size as usize,
                         ) {
                             println!("insert: INTERNAL and split and can_insert");
-                            node.insert(insert_pos, &promoted_key, &promoted_value)?;
-                            node.pointers.insert(insert_pos + 1, right_node.page_id);
-                            BTree::<K, V>::write_node(node, &mut self.page_manager)?;
-                            BTree::<K, V>::write_node(&right_node, &mut self.page_manager)?;
+                            page.insert(insert_pos, &child_promoted_key, &child_promoted_value)?;
+                            page.pointers.insert(insert_pos + 1, child_right.page_id);
+                            BTree::<K, V>::write_page(page, &mut self.page_manager)?;
+                            BTree::<K, V>::write_page(&child_right, &mut self.page_manager)?;
                             Ok(None)
                         } else {
                             println!("insert: INTERNAL and split and not can_insert");
 
                             let new_page_id = self.page_manager.allocate_page()?;
-                            let (med_key, med_value, mut right) = node.split(new_page_id)?;
+                            let (to_promote_key, to_promote_value, mut right_of_current) =
+                                page.split(new_page_id)?;
 
-                            if promoted_key < med_key {
-                                let insert_pos = node.find_key_position(&promoted_key)?;
-                                node.insert(insert_pos, &promoted_key, &promoted_value)?;
-                                node.pointers.insert(insert_pos + 1, right.page_id);
-                            } else if promoted_key > med_key {
-                                let insert_pos = right.find_key_position(&promoted_key)?;
-                                right.insert(insert_pos, &promoted_key, &promoted_value)?;
-                                right.pointers.insert(insert_pos + 1, right_node.page_id);
+                            if child_promoted_key < to_promote_key {
+                                let insert_pos = page.find_key_position(&child_promoted_key)?;
+                                page.insert(
+                                    insert_pos,
+                                    &child_promoted_key,
+                                    &child_promoted_value,
+                                )?;
+                                page.pointers
+                                    .insert(insert_pos + 1, right_of_current.page_id);
+                            } else if child_promoted_key > to_promote_key {
+                                let insert_pos =
+                                    right_of_current.find_key_position(&child_promoted_key)?;
+                                right_of_current.insert(
+                                    insert_pos,
+                                    &child_promoted_key,
+                                    &child_promoted_value,
+                                )?;
+                                right_of_current
+                                    .pointers
+                                    .insert(insert_pos + 1, child_right.page_id);
                             } else {
                                 panic!("Weird")
                             }
 
-                            BTree::<K, V>::write_node(node, &mut self.page_manager)?;
-                            BTree::<K, V>::write_node(&right, &mut self.page_manager)?;
+                            BTree::<K, V>::write_page(&child_right, &mut self.page_manager)?;
+                            BTree::<K, V>::write_page(&right_of_current, &mut self.page_manager)?;
                             self.header.add_page();
-                            Ok(Some((med_key, med_value, right)))
+                            Ok(Some((to_promote_key, to_promote_value, right_of_current)))
                         }
                     }
                     None => Ok(None),
@@ -255,16 +260,17 @@ where
         Ok(())
     }
 
-    fn write_node(
+    fn write_page(
         page: &SlottedPage<K, V>,
         page_manager: &mut PageManager,
     ) -> Result<(), BTreeError> {
+        println!("write_page: {}", page.page_id);
         let data = page.serialize(page_manager.page_size.try_into().unwrap())?;
         page_manager.write_page(page.page_id, &data)?;
         Ok(())
     }
 
-    fn read_node(&mut self, page_id: u64) -> Result<SlottedPage<K, V>, BTreeError> {
+    fn read_page(&mut self, page_id: u64) -> Result<SlottedPage<K, V>, BTreeError> {
         let (buffer, _) = self.page_manager.read_page(page_id)?;
         let node: SlottedPage<K, V> = SlottedPage::deserialize(&buffer);
 
@@ -275,7 +281,7 @@ where
         if level == 10 {
             panic!("Recursive limit");
         }
-        let node = self.read_node(page_id).unwrap();
+        let node = self.read_page(page_id).unwrap();
         let prior_char = if level == 0 {
             ""
         } else {

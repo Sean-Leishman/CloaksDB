@@ -53,7 +53,7 @@ impl Header {
         self.page_count == 0
     }
 
-    pub fn add_root_node(&mut self, root_page_id: u64) {
+    pub fn add_root_page(&mut self, root_page_id: u64) {
         self.root_page_id = root_page_id;
         self.add_page();
     }
