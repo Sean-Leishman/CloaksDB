@@ -18,10 +18,10 @@ pub struct BTree<K, V> {
 
 impl<K, V> BTree<K, V>
 where
-    K: Clone + PartialOrd + Debug + Serialize + for<'de> Deserialize<'de>,
+    K: Clone + PartialOrd + Debug + Serialize + for<'de> Deserialize<'de> + ToString,
     V: Clone + Debug + Serialize + for<'de> Deserialize<'de>,
 {
-    pub fn new(file: File, page_size: u64) -> BTree<K, V> {
+    pub fn new(file: File, page_size: u64) -> Result<BTree<K, V>, BTreeError> {
         let mut page_manager = PageManager::new(file, page_size, Header::SIZE as u64);
         let mut header = match Self::read_header(&mut page_manager) {
             Ok(header) => header,
@@ -46,12 +46,12 @@ where
                 _phantom: PhantomData,
             };
 
-            BTree::<K, V>::write_header(&mut btree.header, &mut btree.page_manager).unwrap();
-            BTree::<K, V>::write_page(&root_page, &mut btree.page_manager).unwrap();
+            BTree::<K, V>::write_header(&mut btree.header, &mut btree.page_manager)?;
+            BTree::<K, V>::write_page(&root_page, &mut btree.page_manager)?;
 
-            Self::read_header(&mut btree.page_manager).unwrap();
+            Self::read_header(&mut btree.page_manager)?;
 
-            return btree;
+            return Ok(btree);
         }
 
         let btree = BTree::<K, V> {
@@ -59,7 +59,7 @@ where
             page_manager: page_manager,
             _phantom: PhantomData,
         };
-        btree
+        Ok(btree)
     }
 
     fn read_header(page_manager: &mut PageManager) -> Result<Header, BTreeError> {
@@ -80,17 +80,28 @@ where
     }
 
     pub fn search(&mut self, key: K) -> Result<V, BTreeError> {
-        self.search_node(key, self.header.root_page_id)
+        self.search_node(&key, self.header.root_page_id)
     }
 
-    fn search_node(&mut self, key: K, page_id: u64) -> Result<V, BTreeError> {
+    fn search_node(&mut self, key: &K, page_id: u64) -> Result<V, BTreeError> {
         let node = self.read_page(page_id)?;
         match node.node_type {
             NodeType::INTERNAL => {
-                let child_node_id = node.get_pointer(&key)?;
-                self.search_node(key, child_node_id)
+                let key_pos = node.find_exact_key(&key)?;
+                match key_pos {
+                    Some(key_pos) => node.read_value(key_pos),
+                    None => {
+                        let child_node_id = node.get_pointer(&key)?;
+                        self.search_node(key, child_node_id)
+                    }
+                }
             }
-            NodeType::LEAF => node.read_value(node.find_exact_key(&key)?),
+            NodeType::LEAF => {
+                let key_pos = node
+                    .find_exact_key(&key)?
+                    .ok_or(BTreeError::KeyNotFound(key.to_string()))?;
+                node.read_value(key_pos)
+            }
         }
     }
 
@@ -100,10 +111,6 @@ where
         if let Some((promoted_key, promoted_value, right)) =
             self.insert_into_page(&mut root, key.clone(), value.clone())?
         {
-            println!(
-                "full root: promoted_key={:?} \n\tnode={:?} \n\tright_node={:?}",
-                promoted_key, root, right
-            );
             let mut new_root =
                 Self::create_page(&mut self.header, NodeType::INTERNAL, &mut self.page_manager);
 
@@ -131,50 +138,35 @@ where
             NodeType::LEAF => {
                 // If leaf is overflowing, it should be split
                 // Parent should point to current node AND a new node
-                match page.find_exact_key(&key) {
-                    Ok(pos) => {
+                match page.find_exact_key(&key)? {
+                    Some(pos) => {
                         page.update(pos, &key, &value)?;
                         BTree::<K, V>::write_page(page, &mut self.page_manager)?;
                         Ok(None)
                     }
-                    Err(_) => {
-                        if page.can_insert(&key, &value, self.header.page_size as usize) {
-                            println!("insert: LEAF and can_insert");
+                    None => {
+                        let key_len = bincode::serialize(&key)?.len();
+                        let value_len = bincode::serialize(&key)?.len();
+                        if page.can_insert(key_len, value_len) {
                             let pos = page.find_key_position(&key)?;
                             page.insert(pos, &key, &value)?;
                             BTree::<K, V>::write_page(page, &mut self.page_manager)?;
                             Ok(None)
                         } else {
-                            println!("insert: LEAF and not can_insert");
                             let new_page_id = self.page_manager.allocate_page()?;
                             let (promoted_key, promoted_value, mut right) =
                                 page.split(new_page_id)?;
 
-                            println!(
-                                "insert: promoted_key={:?}\nright_node={:?}\nnode={:?}",
-                                promoted_key, right, page
-                            );
-
                             if key < promoted_key {
-                                println!(
-                                    "insert: into first node promoted_key={:?} key={:?}",
-                                    promoted_key, key
-                                );
                                 let pos = page.find_key_position(&key)?;
                                 page.insert(pos, &key, &value)?;
                             } else if promoted_key < key {
                                 let pos = right.find_key_position(&key)?;
                                 right.insert(pos, &key, &value)?;
-                                println!(
-                                    "insert: into second node promoted_key={:?} key={:?}",
-                                    promoted_key, key
-                                );
                             } else {
                                 panic!("Weird");
                             }
 
-                            println!("insert: write node={:?}", page);
-                            println!("insert: write right_node={:?}", right);
                             BTree::<K, V>::write_page(page, &mut self.page_manager)?;
                             BTree::<K, V>::write_page(&right, &mut self.page_manager)?;
 
@@ -194,21 +186,16 @@ where
                 match self.insert_into_page(&mut child, key.clone(), value.clone())? {
                     Some((child_promoted_key, child_promoted_value, child_right)) => {
                         let insert_pos = page.find_key_position(&child_promoted_key)?;
-                        println!("insert: INTERNAL and split");
                         if page.can_insert(
-                            &child_promoted_key,
-                            &child_promoted_value,
-                            self.header.page_size as usize,
+                            bincode::serialize(&child_promoted_key)?.len(),
+                            bincode::serialize(&child_promoted_value)?.len(),
                         ) {
-                            println!("insert: INTERNAL and split and can_insert");
                             page.insert(insert_pos, &child_promoted_key, &child_promoted_value)?;
                             page.pointers.insert(insert_pos + 1, child_right.page_id);
                             BTree::<K, V>::write_page(page, &mut self.page_manager)?;
                             BTree::<K, V>::write_page(&child_right, &mut self.page_manager)?;
                             Ok(None)
                         } else {
-                            println!("insert: INTERNAL and split and not can_insert");
-
                             let new_page_id = self.page_manager.allocate_page()?;
                             let (to_promote_key, to_promote_value, mut right_of_current) =
                                 page.split(new_page_id)?;
@@ -264,15 +251,15 @@ where
         page: &SlottedPage<K, V>,
         page_manager: &mut PageManager,
     ) -> Result<(), BTreeError> {
-        println!("write_page: {}", page.page_id);
-        let data = page.serialize(page_manager.page_size.try_into().unwrap())?;
+        let data = page.serialize()?;
         page_manager.write_page(page.page_id, &data)?;
         Ok(())
     }
 
     fn read_page(&mut self, page_id: u64) -> Result<SlottedPage<K, V>, BTreeError> {
         let (buffer, _) = self.page_manager.read_page(page_id)?;
-        let node: SlottedPage<K, V> = SlottedPage::deserialize(&buffer);
+        let node: SlottedPage<K, V> =
+            SlottedPage::deserialize(&buffer, self.header.page_size as usize);
 
         Ok(node)
     }

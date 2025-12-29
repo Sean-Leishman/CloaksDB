@@ -85,17 +85,15 @@ impl PageManager {
             ));
         }
 
-        let byte_offset = self.file.seek(std::io::SeekFrom::Start(0))?;
-        println!("write_header: {:?} {}", data, byte_offset);
+        let _ = self.file.seek(std::io::SeekFrom::Start(0))?;
         self.file.write_all(data)?;
         Ok(())
     }
 
     pub fn read_header(&mut self) -> Result<Vec<u8>, std::io::Error> {
         let mut buffer = vec![0u8; self.header_size as usize];
-        let byte_offset = self.file.seek(std::io::SeekFrom::Start(0))?;
+        let _ = self.file.seek(std::io::SeekFrom::Start(0))?;
         self.file.read(&mut buffer)?;
-        println!("read_header: {:?} {}", buffer, byte_offset);
         Ok(buffer)
     }
 

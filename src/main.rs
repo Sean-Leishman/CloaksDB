@@ -14,7 +14,7 @@ fn main() {
         .open(&index_filename)
         .expect("Failed to open file");
 
-    let mut btree = BTree::<i64, i64>::new(file, 1024);
+    let mut btree = BTree::<i64, i64>::new(file, 1024).unwrap();
     let mut rng = rand::rng();
 
     for i in 400..1000 {
