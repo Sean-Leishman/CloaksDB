@@ -64,6 +64,7 @@ where
 
     fn read_header(page_manager: &mut PageManager) -> Result<Header, BTreeError> {
         let buffer = page_manager.read_header()?;
+        println!("read_header: buffer {:?}", buffer);
         Ok(Header::deserialize(&buffer)?)
     }
 
@@ -119,6 +120,7 @@ where
             new_root.pointers.push(right.page_id);
 
             BTree::<K, V>::write_page(&new_root, &mut self.page_manager)?;
+            BTree::<K, V>::write_page(&root, &mut self.page_manager)?;
             self.header.root_page_id = new_root.page_id;
 
             return Ok(());
@@ -149,6 +151,7 @@ where
                         let value_len = bincode::serialize(&key)?.len();
                         if page.can_insert(key_len, value_len) {
                             let pos = page.find_key_position(&key)?;
+                            println!("LEAF insert: pos={}, key={:?}", pos, key);
                             page.insert(pos, &key, &value)?;
                             BTree::<K, V>::write_page(page, &mut self.page_manager)?;
                             Ok(None)
@@ -207,8 +210,7 @@ where
                                     &child_promoted_key,
                                     &child_promoted_value,
                                 )?;
-                                page.pointers
-                                    .insert(insert_pos + 1, right_of_current.page_id);
+                                page.pointers.insert(insert_pos + 1, child_right.page_id);
                             } else if child_promoted_key > to_promote_key {
                                 let insert_pos =
                                     right_of_current.find_key_position(&child_promoted_key)?;
@@ -283,7 +285,7 @@ where
         };
 
         let keys = node.read_keys().unwrap();
-        let stringified_keys = match keys.len() <= 5 {
+        let stringified_keys = match keys.len() <= 200 {
             true => format!("{:?}", keys),
             false => {
                 let start = &keys[..2];
@@ -308,5 +310,1006 @@ where
         println!("BTREE: {}", self.header.root_page_id);
         self.print(self.header.root_page_id, 0, 0);
         println!("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    // ─────────────────────────────────────────────────────────
+    // Test Helpers
+    // ─────────────────────────────────────────────────────────
+
+    fn create_temp_btree<K, V>(page_size: u64) -> BTree<K, V>
+    where
+        K: Clone + PartialOrd + Debug + Serialize + for<'de> Deserialize<'de> + ToString,
+        V: Clone + Debug + Serialize + for<'de> Deserialize<'de>,
+    {
+        let file = NamedTempFile::new().unwrap();
+        BTree::new(file.reopen().unwrap(), page_size).unwrap()
+    }
+
+    fn create_btree_with_file<K, V>(
+        page_size: u64,
+    ) -> (BTree<K, V>, std::path::PathBuf, NamedTempFile)
+    where
+        K: Clone + PartialOrd + Debug + Serialize + for<'de> Deserialize<'de> + ToString,
+        V: Clone + Debug + Serialize + for<'de> Deserialize<'de>,
+    {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_owned();
+        println!("BTree::new from file: {:?}", path);
+        let btree = BTree::new(file.reopen().unwrap(), page_size).unwrap();
+        (btree, path, file)
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Initialization Tests
+    // ─────────────────────────────────────────────────────────
+
+    mod initialization {
+        use super::*;
+
+        #[test]
+        fn new_btree_creates_root_page() {
+            let btree = create_temp_btree::<i64, String>(4096);
+
+            assert_eq!(btree.header.page_count, 1);
+            assert_eq!(btree.header.root_page_id, 0);
+        }
+
+        #[test]
+        fn new_btree_sets_page_size() {
+            let btree = create_temp_btree::<i64, String>(8192);
+
+            assert_eq!(btree.header.page_size, 8192);
+        }
+
+        #[test]
+        fn new_btree_sets_version() {
+            let btree = create_temp_btree::<i64, String>(4096);
+
+            assert_eq!(btree.header.version, VERSION);
+        }
+
+        #[test]
+        fn new_btree_root_is_leaf() {
+            let mut btree = create_temp_btree::<i64, String>(4096);
+
+            let root = btree.read_page(btree.header.root_page_id).unwrap();
+            assert_eq!(root.node_type, NodeType::LEAF);
+        }
+
+        #[test]
+        fn different_page_sizes() {
+            for page_size in [256, 512, 1024, 4096, 8192] {
+                let btree = create_temp_btree::<i64, i64>(page_size);
+                assert_eq!(btree.header.page_size, page_size);
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Header Management Tests
+    // ─────────────────────────────────────────────────────────
+
+    mod header_management {
+        use super::*;
+
+        #[test]
+        fn read_header_after_creation() {
+            let mut btree = create_temp_btree::<i64, String>(4096);
+
+            let header = BTree::<i64, String>::read_header(&mut btree.page_manager).unwrap();
+
+            assert_eq!(header.page_count, 1);
+            assert_eq!(header.page_size, 4096);
+        }
+
+        #[test]
+        fn header_persists_after_write() {
+            let (mut btree, path, file) = create_btree_with_file::<i64, String>(4096);
+
+            btree.insert(1, "one".to_string()).unwrap();
+            btree.insert(2, "two".to_string()).unwrap();
+
+            println!(
+                "header_persists_after_write written: {:?}",
+                btree.header.serialize()
+            );
+
+            let page_count = btree.header.page_count;
+
+            println!("header_persists_after_write: {:?}", path);
+
+            // Reopen
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+
+            let btree_copy = BTree::<i64, String>::new(file, 4096).unwrap();
+            assert_eq!(btree_copy.header.page_count, page_count);
+        }
+
+        #[test]
+        fn page_count_increments_on_create_page() {
+            let mut btree = create_temp_btree::<i64, i64>(256);
+
+            let initial_count = btree.header.page_count;
+
+            // Insert enough to cause splits
+            for i in 0..100 {
+                btree.insert(i, i).unwrap();
+            }
+
+            assert!(btree.header.page_count > initial_count);
+        }
+
+        #[test]
+        fn root_page_id_changes_on_root_split() {
+            let mut btree = create_temp_btree::<i64, i64>(256);
+
+            let initial_root = btree.header.root_page_id;
+
+            // Insert enough to cause root split
+            for i in 0..100 {
+                btree.insert(i, i).unwrap();
+            }
+
+            // Root should change when tree grows taller
+            assert_ne!(btree.header.root_page_id, initial_root);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Search Tests
+    // ─────────────────────────────────────────────────────────
+
+    mod search {
+        use super::*;
+
+        #[test]
+        fn search_single_key() {
+            let mut btree = create_temp_btree::<i64, String>(4096);
+
+            btree.insert(42, "answer".to_string()).unwrap();
+
+            assert_eq!(btree.search(42).unwrap(), "answer");
+        }
+
+        #[test]
+        fn search_nonexistent_key_returns_error() {
+            let mut btree = create_temp_btree::<i64, String>(4096);
+
+            btree.insert(1, "one".to_string()).unwrap();
+
+            let result = btree.search(999);
+            assert!(matches!(result, Err(BTreeError::KeyNotFound(_))));
+        }
+
+        #[test]
+        fn search_empty_tree_returns_error() {
+            let mut btree = create_temp_btree::<i64, String>(4096);
+
+            let result = btree.search(1);
+            assert!(matches!(result, Err(BTreeError::KeyNotFound(_))));
+        }
+
+        #[test]
+        fn search_first_key() {
+            let mut btree = create_temp_btree::<i64, i64>(4096);
+
+            for i in 0..100 {
+                btree.insert(i, i * 10).unwrap();
+            }
+
+            assert_eq!(btree.search(0).unwrap(), 0);
+        }
+
+        #[test]
+        fn search_last_key() {
+            let mut btree = create_temp_btree::<i64, i64>(4096);
+
+            for i in 0..100 {
+                btree.insert(i, i * 10).unwrap();
+            }
+
+            assert_eq!(btree.search(99).unwrap(), 990);
+        }
+
+        #[test]
+        fn search_middle_key() {
+            let mut btree = create_temp_btree::<i64, i64>(4096);
+
+            for i in 0..100 {
+                btree.insert(i, i * 10).unwrap();
+            }
+
+            assert_eq!(btree.search(50).unwrap(), 500);
+        }
+
+        #[test]
+        fn search_after_splits() {
+            let mut btree = create_temp_btree::<i64, i64>(256);
+
+            // Insert enough to cause multiple splits
+            for i in 0..200 {
+                btree.insert(i, i).unwrap();
+            }
+
+            // All keys should still be findable
+            for i in 0..200 {
+                assert_eq!(btree.search(i).unwrap(), i);
+            }
+        }
+
+        #[test]
+        fn search_with_string_keys() {
+            let mut btree = create_temp_btree::<String, i64>(4096);
+
+            btree.insert("apple".to_string(), 1).unwrap();
+            btree.insert("banana".to_string(), 2).unwrap();
+            btree.insert("cherry".to_string(), 3).unwrap();
+
+            assert_eq!(btree.search("banana".to_string()).unwrap(), 2);
+        }
+
+        #[test]
+        fn search_negative_keys() {
+            let mut btree = create_temp_btree::<i64, String>(4096);
+
+            btree.insert(-100, "negative".to_string()).unwrap();
+            btree.insert(0, "zero".to_string()).unwrap();
+            btree.insert(100, "positive".to_string()).unwrap();
+
+            assert_eq!(btree.search(-100).unwrap(), "negative");
+            assert_eq!(btree.search(0).unwrap(), "zero");
+            assert_eq!(btree.search(100).unwrap(), "positive");
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Insert Tests
+    // ─────────────────────────────────────────────────────────
+
+    mod insert {
+        use super::*;
+
+        #[test]
+        fn insert_single_entry() {
+            let mut btree = create_temp_btree::<i64, String>(4096);
+
+            btree.insert(1, "one".to_string()).unwrap();
+
+            assert_eq!(btree.search(1).unwrap(), "one");
+        }
+
+        #[test]
+        fn insert_multiple_sequential() {
+            let mut btree = create_temp_btree::<i64, i64>(4096);
+
+            for i in 0..50 {
+                btree.insert(i, i * 2).unwrap();
+            }
+
+            for i in 0..50 {
+                assert_eq!(btree.search(i).unwrap(), i * 2);
+            }
+        }
+
+        #[test]
+        fn insert_multiple_reverse() {
+            let mut btree = create_temp_btree::<i64, i64>(4096);
+
+            for i in (0..50).rev() {
+                btree.insert(i, i * 2).unwrap();
+            }
+
+            for i in 0..50 {
+                assert_eq!(btree.search(i).unwrap(), i * 2);
+            }
+        }
+
+        #[test]
+        fn insert_random_order() {
+            use rand::rng;
+            use rand::seq::SliceRandom;
+
+            let mut btree = create_temp_btree::<i64, i64>(4096);
+            let mut keys: Vec<i64> = (0..100).collect();
+            keys.shuffle(&mut rng());
+
+            for &k in &keys {
+                btree.insert(k, k * 10).unwrap();
+            }
+
+            for k in 0..100 {
+                assert_eq!(btree.search(k).unwrap(), k * 10);
+            }
+        }
+
+        #[test]
+        fn insert_updates_existing_key() {
+            let mut btree = create_temp_btree::<i64, String>(4096);
+
+            btree.insert(1, "original".to_string()).unwrap();
+            btree.insert(1, "updated".to_string()).unwrap();
+
+            assert_eq!(btree.search(1).unwrap(), "updated");
+        }
+
+        #[test]
+        fn insert_update_preserves_other_keys() {
+            let mut btree = create_temp_btree::<i64, String>(4096);
+
+            btree.insert(1, "one".to_string()).unwrap();
+            btree.insert(2, "two".to_string()).unwrap();
+            btree.insert(3, "three".to_string()).unwrap();
+
+            btree.insert(2, "TWO".to_string()).unwrap();
+
+            assert_eq!(btree.search(1).unwrap(), "one");
+            assert_eq!(btree.search(2).unwrap(), "TWO");
+            assert_eq!(btree.search(3).unwrap(), "three");
+        }
+
+        #[test]
+        fn insert_many_updates_same_key() {
+            let mut btree = create_temp_btree::<i64, i64>(4096);
+
+            btree.insert(1, 0).unwrap();
+
+            for i in 1..=100 {
+                btree.insert(1, i).unwrap();
+            }
+
+            assert_eq!(btree.search(1).unwrap(), 100);
+        }
+
+        #[test]
+        fn insert_different_value_types() {
+            // String values
+            let mut btree1 = create_temp_btree::<i64, String>(4096);
+            btree1.insert(1, "hello".to_string()).unwrap();
+            assert_eq!(btree1.search(1).unwrap(), "hello");
+
+            // Vector values
+            let mut btree2 = create_temp_btree::<i64, Vec<u8>>(4096);
+            btree2.insert(1, vec![1, 2, 3, 4, 5]).unwrap();
+            assert_eq!(btree2.search(1).unwrap(), vec![1, 2, 3, 4, 5]);
+
+            // Tuple values
+            let mut btree3 = create_temp_btree::<i64, (i64, String)>(4096);
+            btree3.insert(1, (42, "answer".to_string())).unwrap();
+            assert_eq!(btree3.search(1).unwrap(), (42, "answer".to_string()));
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Split Tests
+    // ─────────────────────────────────────────────────────────
+
+    mod split {
+        use super::*;
+
+        #[test]
+        fn insert_causes_leaf_split() {
+            let mut btree = create_temp_btree::<i64, String>(512);
+
+            let initial_page_count = btree.header.page_count;
+
+            for i in 0..30 {
+                btree.insert(i, format!("value_{}", i)).unwrap();
+            }
+
+            assert!(
+                btree.header.page_count > initial_page_count,
+                "Page count should increase after splits"
+            );
+        }
+
+        #[test]
+        fn split_maintains_all_data() {
+            let mut btree = create_temp_btree::<i64, i64>(256);
+
+            for i in 0..100 {
+                btree.insert(i, i * 10).unwrap();
+            }
+
+            // Verify all data is still accessible
+            for i in 0..100 {
+                assert_eq!(
+                    btree.search(i).unwrap(),
+                    i * 10,
+                    "Key {} should have value {}",
+                    i,
+                    i * 10
+                );
+            }
+        }
+
+        #[test]
+        fn multiple_splits_maintain_order() {
+            let mut btree = create_temp_btree::<i64, i64>(256);
+
+            // Insert in random order
+            let keys = vec![50, 25, 75, 10, 30, 60, 90, 5, 15, 27, 35, 55, 70, 80, 95];
+
+            for &k in &keys {
+                btree.insert(k, k).unwrap();
+            }
+
+            // All should be findable
+            for &k in &keys {
+                assert_eq!(btree.search(k).unwrap(), k);
+            }
+        }
+
+        #[test]
+        fn root_split_creates_new_root() {
+            let mut btree = create_temp_btree::<i64, i64>(256);
+
+            let initial_root = btree.header.root_page_id;
+
+            // Insert enough to cause root to split
+            for i in 0..50 {
+                btree.insert(i, i).unwrap();
+            }
+
+            // Verify root changed
+            assert_ne!(btree.header.root_page_id, initial_root);
+
+            // New root should be internal node
+            let root = btree.read_page(btree.header.root_page_id).unwrap();
+            assert_eq!(root.node_type, NodeType::INTERNAL);
+        }
+
+        #[test]
+        fn split_with_sequential_inserts() {
+            let mut btree = create_temp_btree::<i64, i64>(256);
+
+            for i in 0..200 {
+                btree.insert(i, i).unwrap();
+                // Verify all previous inserts still work
+                for j in 0..=i {
+                    assert_eq!(btree.search(j).unwrap(), j, "Failed after inserting {}", i);
+                }
+            }
+        }
+
+        #[test]
+        fn split_with_reverse_inserts() {
+            let mut btree = create_temp_btree::<i64, i64>(256);
+
+            for i in (0..200).rev() {
+                btree.insert(i, i).unwrap();
+            }
+
+            for i in 0..200 {
+                assert_eq!(btree.search(i).unwrap(), i);
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Internal Node Tests
+    // ─────────────────────────────────────────────────────────
+
+    mod internal_nodes {
+        use super::*;
+
+        #[test]
+        fn internal_node_pointers_correct() {
+            let mut btree = create_temp_btree::<i64, i64>(256);
+
+            // Insert enough to create internal nodes
+            for i in 0..100 {
+                btree.insert(i, i).unwrap();
+            }
+
+            let root = btree.read_page(btree.header.root_page_id).unwrap();
+
+            if root.node_type == NodeType::INTERNAL {
+                // Internal node should have pointers
+                assert!(!root.pointers.is_empty());
+                // Should have one more pointer than keys
+                assert_eq!(root.pointers.len(), root.num_keys as usize + 1);
+            }
+        }
+
+        #[test]
+        fn search_traverses_internal_nodes() {
+            let mut btree = create_temp_btree::<i64, i64>(256);
+
+            for i in 0..100 {
+                btree.insert(i, i * 10).unwrap();
+            }
+
+            // These searches should traverse internal nodes
+            assert_eq!(btree.search(0).unwrap(), 0);
+            assert_eq!(btree.search(50).unwrap(), 500);
+            assert_eq!(btree.search(99).unwrap(), 990);
+        }
+
+        #[test]
+        fn internal_node_split_preserves_data() {
+            let mut btree = create_temp_btree::<i64, i64>(256);
+
+            // Insert many entries to cause internal node splits
+            for i in 0..500 {
+                btree.insert(i, i).unwrap();
+            }
+
+            // Verify all data
+            for i in 0..500 {
+                assert_eq!(btree.search(i).unwrap(), i, "Key {} not found", i);
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Page I/O Tests
+    // ─────────────────────────────────────────────────────────
+
+    mod page_io {
+        use super::*;
+
+        #[test]
+        fn read_page_returns_correct_data() {
+            let mut btree = create_temp_btree::<i64, String>(4096);
+
+            btree.insert(1, "one".to_string()).unwrap();
+            btree.insert(2, "two".to_string()).unwrap();
+
+            let page = btree.read_page(btree.header.root_page_id).unwrap();
+
+            assert_eq!(page.num_keys, 2);
+        }
+
+        #[test]
+        fn write_and_read_page_roundtrip() {
+            let (mut btree, path, _) = create_btree_with_file::<i64, String>(4096);
+
+            btree.insert(1, "one".to_string()).unwrap();
+            btree.insert(2, "two".to_string()).unwrap();
+            btree.insert(3, "three".to_string()).unwrap();
+
+            let root_id = btree.header.root_page_id;
+            drop(btree);
+
+            // Reopen and read
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+
+            let mut btree = BTree::<i64, String>::new(file, 4096).unwrap();
+            let page = btree.read_page(root_id).unwrap();
+
+            assert_eq!(page.num_keys, 3);
+        }
+
+        #[test]
+        fn create_page_increments_count() {
+            let mut btree = create_temp_btree::<i64, i64>(256);
+
+            let initial = btree.header.page_count;
+
+            // Force page creation via splits
+            for i in 0..50 {
+                btree.insert(i, i).unwrap();
+            }
+
+            assert!(btree.header.page_count > initial);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Edge Cases
+    // ─────────────────────────────────────────────────────────
+
+    mod edge_cases {
+        use super::*;
+
+        #[test]
+        fn empty_string_key() {
+            let mut btree = create_temp_btree::<String, i64>(4096);
+
+            btree.insert("".to_string(), 42).unwrap();
+
+            assert_eq!(btree.search("".to_string()).unwrap(), 42);
+        }
+
+        #[test]
+        fn empty_string_value() {
+            let mut btree = create_temp_btree::<i64, String>(4096);
+
+            btree.insert(1, "".to_string()).unwrap();
+
+            assert_eq!(btree.search(1).unwrap(), "");
+        }
+
+        #[test]
+        fn large_key() {
+            let mut btree = create_temp_btree::<String, i64>(4096);
+
+            let large_key = "x".repeat(500);
+            btree.insert(large_key.clone(), 42).unwrap();
+
+            assert_eq!(btree.search(large_key).unwrap(), 42);
+        }
+
+        #[test]
+        fn large_value() {
+            let mut btree = create_temp_btree::<i64, String>(4096);
+
+            let large_value = "y".repeat(1000);
+            btree.insert(1, large_value.clone()).unwrap();
+
+            assert_eq!(btree.search(1).unwrap(), large_value);
+        }
+
+        #[test]
+        fn min_max_i64_keys() {
+            let mut btree = create_temp_btree::<i64, String>(4096);
+
+            btree.insert(i64::MIN, "min".to_string()).unwrap();
+            btree.insert(i64::MAX, "max".to_string()).unwrap();
+            btree.insert(0, "zero".to_string()).unwrap();
+
+            assert_eq!(btree.search(i64::MIN).unwrap(), "min");
+            assert_eq!(btree.search(i64::MAX).unwrap(), "max");
+            assert_eq!(btree.search(0).unwrap(), "zero");
+        }
+
+        #[test]
+        fn unicode_keys() {
+            let mut btree = create_temp_btree::<String, i64>(4096);
+
+            btree.insert("こんにちは".to_string(), 1).unwrap();
+            btree.insert("مرحبا".to_string(), 2).unwrap();
+            btree.insert("🎉🎊🎁".to_string(), 3).unwrap();
+
+            assert_eq!(btree.search("こんにちは".to_string()).unwrap(), 1);
+            assert_eq!(btree.search("مرحبا".to_string()).unwrap(), 2);
+            assert_eq!(btree.search("🎉🎊🎁".to_string()).unwrap(), 3);
+        }
+
+        #[test]
+        fn special_characters_in_keys() {
+            let mut btree = create_temp_btree::<String, i64>(4096);
+
+            let special_keys = vec![
+                "\n\t\r",
+                "key with spaces",
+                "key\0with\0nulls",
+                "key'with\"quotes",
+                "key\\with\\backslashes",
+            ];
+
+            for (i, key) in special_keys.iter().enumerate() {
+                btree.insert(key.to_string(), i as i64).unwrap();
+            }
+
+            for (i, key) in special_keys.iter().enumerate() {
+                assert_eq!(btree.search(key.to_string()).unwrap(), i as i64);
+            }
+        }
+
+        #[test]
+        fn duplicate_inserts_idempotent() {
+            let mut btree = create_temp_btree::<i64, i64>(4096);
+
+            for _ in 0..100 {
+                btree.insert(1, 42).unwrap();
+            }
+
+            assert_eq!(btree.search(1).unwrap(), 42);
+
+            // Should only have one entry in root
+            let root = btree.read_page(btree.header.root_page_id).unwrap();
+            assert_eq!(root.num_keys, 1);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Stress Tests
+    // ─────────────────────────────────────────────────────────
+
+    mod stress {
+        use super::*;
+
+        #[test]
+        fn insert_one_thousand_sequential() {
+            let mut btree = create_temp_btree::<i64, i64>(4096);
+
+            for i in 0..1000 {
+                btree.insert(i, i * 2).unwrap();
+            }
+
+            for i in 0..1000 {
+                assert_eq!(btree.search(i).unwrap(), i * 2);
+            }
+        }
+
+        #[test]
+        fn insert_one_hundred_random() {
+            use rand::rng;
+            use rand::seq::SliceRandom;
+
+            let mut btree = create_temp_btree::<i64, i64>(256);
+            let mut keys: Vec<i64> = (0..100).collect();
+            keys.shuffle(&mut rng());
+
+            for &k in &keys {
+                btree.insert(k, k).unwrap();
+                println!("Insert: {:?}", k);
+                btree.print_tree();
+            }
+
+            btree.print_tree();
+
+            for &k in &keys {
+                assert_eq!(btree.search(k).unwrap(), k);
+            }
+        }
+
+        #[test]
+        fn insert_one_thousand_random() {
+            use rand::rng;
+            use rand::seq::SliceRandom;
+
+            let mut btree = create_temp_btree::<i64, i64>(4096);
+            let mut keys: Vec<i64> = (0..1000).collect();
+            keys.shuffle(&mut rng());
+
+            for &k in &keys {
+                btree.insert(k, k).unwrap();
+            }
+            btree.print_tree();
+
+            for &k in &keys {
+                assert_eq!(btree.search(k).unwrap(), k);
+            }
+        }
+
+        #[test]
+        fn small_page_many_splits() {
+            let mut btree = create_temp_btree::<i64, i64>(256);
+
+            for i in 0..500 {
+                btree.insert(i, i).unwrap();
+            }
+
+            // Verify tree integrity
+            for i in 0..500 {
+                assert_eq!(btree.search(i).unwrap(), i);
+            }
+
+            // Should have created many pages
+            assert!(btree.header.page_count > 10);
+        }
+
+        #[test]
+        fn alternating_insert_and_search() {
+            let mut btree = create_temp_btree::<i64, i64>(4096);
+
+            for i in 0..500 {
+                btree.insert(i, i * 10).unwrap();
+
+                // Verify this and some previous inserts
+                assert_eq!(btree.search(i).unwrap(), i * 10);
+
+                if i > 0 {
+                    assert_eq!(btree.search(i / 2).unwrap(), (i / 2) * 10);
+                }
+            }
+        }
+
+        #[test]
+        fn many_updates() {
+            let mut btree = create_temp_btree::<i64, i64>(4096);
+
+            // Insert initial values
+            for i in 0..100 {
+                btree.insert(i, 0).unwrap();
+            }
+
+            // Update each key many times
+            for round in 1..=50 {
+                for i in 0..100 {
+                    btree.insert(i, round).unwrap();
+                }
+            }
+
+            // Verify final values
+            for i in 0..100 {
+                assert_eq!(btree.search(i).unwrap(), 50);
+            }
+        }
+
+        #[test]
+        #[ignore] // Run with: cargo test -- --ignored
+        fn insert_ten_thousand() {
+            let mut btree = create_temp_btree::<i64, i64>(4096);
+
+            for i in 0..10_000 {
+                btree.insert(i, i).unwrap();
+            }
+
+            // Spot check
+            assert_eq!(btree.search(0).unwrap(), 0);
+            assert_eq!(btree.search(5000).unwrap(), 5000);
+            assert_eq!(btree.search(9999).unwrap(), 9999);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Tree Structure Tests
+    // ─────────────────────────────────────────────────────────
+
+    mod tree_structure {
+        use super::*;
+
+        #[test]
+        fn single_entry_stays_in_root() {
+            let mut btree = create_temp_btree::<i64, String>(4096);
+
+            btree.insert(1, "one".to_string()).unwrap();
+            assert_eq!(btree.header.page_count, 1);
+
+            let root = btree.read_page(btree.header.root_page_id).unwrap();
+            assert_eq!(root.node_type, NodeType::LEAF);
+            assert_eq!(root.num_keys, 1);
+        }
+
+        #[test]
+        fn tree_grows_in_height() {
+            let mut btree = create_temp_btree::<i64, i64>(256);
+
+            // Track when root changes (indicates height increase)
+            let mut root_changes = 0;
+            let mut last_root = btree.header.root_page_id;
+
+            for i in 0..200 {
+                btree.insert(i, i).unwrap();
+
+                if btree.header.root_page_id != last_root {
+                    root_changes += 1;
+                    last_root = btree.header.root_page_id;
+                }
+            }
+
+            assert!(
+                root_changes >= 2,
+                "Tree should have grown in height multiple times"
+            );
+        }
+
+        #[test]
+        fn internal_node_has_correct_pointer_count() {
+            let mut btree = create_temp_btree::<i64, i64>(256);
+
+            for i in 0..100 {
+                btree.insert(i, i).unwrap();
+            }
+
+            fn check_pointers<K, V>(btree: &mut BTree<K, V>, page_id: u64)
+            where
+                K: Clone + PartialOrd + Debug + Serialize + for<'de> Deserialize<'de> + ToString,
+                V: Clone + Debug + Serialize + for<'de> Deserialize<'de>,
+            {
+                let page = btree.read_page(page_id).unwrap();
+
+                if page.node_type == NodeType::INTERNAL {
+                    // Internal nodes should have num_keys + 1 pointers
+                    assert_eq!(
+                        page.pointers.len(),
+                        page.num_keys as usize + 1,
+                        "Page {} has {} keys but {} pointers",
+                        page_id,
+                        page.num_keys,
+                        page.pointers.len()
+                    );
+
+                    // Recursively check children
+                    for &ptr in &page.pointers {
+                        check_pointers(btree, ptr);
+                    }
+                } else {
+                    // Leaf nodes should have no pointers
+                    assert!(
+                        page.pointers.is_empty(),
+                        "Leaf page {} should have no pointers",
+                        page_id
+                    );
+                }
+            }
+
+            let root_page_id = btree.header.root_page_id;
+            check_pointers(&mut btree, root_page_id);
+        }
+
+        #[test]
+        fn all_leaves_at_same_depth() {
+            let mut btree = create_temp_btree::<i64, i64>(256);
+
+            for i in 0..100 {
+                btree.insert(i, i).unwrap();
+            }
+
+            fn get_leaf_depths<K, V>(
+                btree: &mut BTree<K, V>,
+                page_id: u64,
+                depth: usize,
+            ) -> Vec<usize>
+            where
+                K: Clone + PartialOrd + Debug + Serialize + for<'de> Deserialize<'de> + ToString,
+                V: Clone + Debug + Serialize + for<'de> Deserialize<'de>,
+            {
+                let page = btree.read_page(page_id).unwrap();
+
+                if page.node_type == NodeType::LEAF {
+                    vec![depth]
+                } else {
+                    page.pointers
+                        .iter()
+                        .flat_map(|&ptr| get_leaf_depths(btree, ptr, depth + 1))
+                        .collect()
+                }
+            }
+
+            let root_page_id = btree.header.root_page_id;
+            let depths = get_leaf_depths(&mut btree, root_page_id, 0);
+
+            // All leaves should be at the same depth
+            let first_depth = depths[0];
+            assert!(
+                depths.iter().all(|&d| d == first_depth),
+                "Leaf depths are not uniform: {:?}",
+                depths
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Error Handling Tests
+    // ─────────────────────────────────────────────────────────
+
+    mod error_handling {
+        use super::*;
+
+        #[test]
+        fn search_returns_key_not_found_error() {
+            let mut btree = create_temp_btree::<i64, String>(4096);
+
+            btree.insert(1, "one".to_string()).unwrap();
+
+            match btree.search(999) {
+                Err(BTreeError::KeyNotFound(key)) => {
+                    assert_eq!(key, "999");
+                }
+                other => panic!("Expected KeyNotFound, got {:?}", other),
+            }
+        }
+
+        #[test]
+        fn search_nonexistent_key_with_string() {
+            let mut btree = create_temp_btree::<String, i64>(4096);
+
+            btree.insert("exists".to_string(), 1).unwrap();
+
+            match btree.search("missing".to_string()) {
+                Err(BTreeError::KeyNotFound(key)) => {
+                    assert_eq!(key, "missing");
+                }
+                other => panic!("Expected KeyNotFound, got {:?}", other),
+            }
+        }
     }
 }

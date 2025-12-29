@@ -1,10 +1,10 @@
 #[derive(Debug)]
 pub struct Header {
     magic_number: u16,
-    version: u16,
+    pub version: u16,
     pub page_size: u64,
     pub root_page_id: u64,
-    page_count: u64,
+    pub page_count: u64,
 }
 
 #[derive(Debug)]
@@ -55,7 +55,6 @@ impl Header {
 
     pub fn add_root_page(&mut self, root_page_id: u64) {
         self.root_page_id = root_page_id;
-        self.add_page();
     }
 
     pub fn add_page(&mut self) {

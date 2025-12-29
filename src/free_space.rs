@@ -1,3 +1,6 @@
+use std::fmt::Debug;
+
+#[derive(Debug)]
 pub struct FreeSpaceRegion {
     pub offset: u16,
     pub length: u16,

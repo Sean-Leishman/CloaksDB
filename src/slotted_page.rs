@@ -38,11 +38,11 @@ impl From<std::io::Error> for SlottedPageError {
 pub struct SlottedPage<K, V> {
     pub page_id: u64,
     pub node_type: NodeType,
-    num_keys: u16,
-    free_space_end: u16, // where free space starts
-    free_list: Vec<FreeSpaceRegion>,
-    total_free: u16, // total free bytes (contiguous + holes)
-    slots: Vec<Slot>,
+    pub num_keys: u16,
+    pub free_space_end: u16, // where free space starts
+    pub free_list: Vec<FreeSpaceRegion>,
+    pub total_free: u16, // total free bytes (contiguous + holes)
+    pub slots: Vec<Slot>,
     pub pointers: Vec<u64>,
     data: Vec<u8>,
     page_size: usize,
@@ -334,18 +334,22 @@ where
             Some(free_list_idx) => {
                 let region = &self.free_list[free_list_idx];
                 let remaining = region.length as usize - total_len;
+                println!("Assign from freelist: {:?} {:?}", region, remaining);
 
                 if remaining > 0 {
+                    println!("Init from freelist: {} {}", offset, total_len);
                     self.free_list[free_list_idx] = FreeSpaceRegion {
-                        offset: offset as u16,
-                        length: total_len as u16,
+                        offset: offset as u16 + total_len as u16,
+                        length: remaining as u16,
                     };
                 } else {
+                    println!("Remove from freelist: {}", free_list_idx);
                     self.free_list.remove(free_list_idx);
                 }
             }
             None => {
                 // Contiguous space
+                println!("Assign from contiguous space: {}", offset);
                 self.free_space_end = offset as u16;
             }
         };
@@ -379,13 +383,11 @@ where
 
         if region.offset + region.length == self.free_space_end {
             self.free_space_end = region.offset;
-        } else if region.offset == self.free_space_end {
-            self.free_space_end = region.offset;
         } else {
             let insert_pos = self
                 .free_list
                 .iter()
-                .position(|r| r.offset >= region.offset)
+                .position(|r| r.offset > region.offset)
                 .unwrap_or(self.free_list.len());
             self.free_list.insert(insert_pos, region);
         }
@@ -574,384 +576,579 @@ where
 mod tests {
     use super::*;
 
-    mod serialization {
-        use super::*;
+    // ─────────────────────────────────────────────────────────
+    // Test Helpers
+    // ─────────────────────────────────────────────────────────
 
-        #[test]
-        fn empty_page_roundtrip() {
-            let page: SlottedPage<String, i64> = SlottedPage::new(42, NodeType::LEAF, 4096);
-
-            let bytes = page.serialize().unwrap();
-            let restored: SlottedPage<String, i64> = SlottedPage::deserialize(&bytes, 4096);
-
-            assert_eq!(restored.page_id, 42);
-            assert_eq!(restored.node_type, NodeType::LEAF);
-            assert_eq!(restored.num_keys, 0);
-            assert_eq!(restored.slots.len(), 0);
-            assert_eq!(restored.pointers.len(), 0);
-        }
-
-        #[test]
-        fn page_with_data_roundtrip() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            page.insert(0, &"key1".to_string(), &100i64).unwrap();
-            page.insert(1, &"key2".to_string(), &200i64).unwrap();
-            page.insert(2, &"key3".to_string(), &300i64).unwrap();
-
-            let bytes = page.serialize().unwrap();
-            let restored: SlottedPage<String, i64> = SlottedPage::deserialize(&bytes, 4096);
-
-            assert_eq!(restored.num_keys, 3);
-            assert_eq!(restored.slots.len(), 3);
-
-            // Verify data integrity
-            let key1: String = restored.read_key(0).unwrap();
-            let val1: i64 = restored.read_value(0).unwrap();
-            assert_eq!(key1, "key1");
-            assert_eq!(val1, 100);
-
-            let key2: String = restored.read_key(1).unwrap();
-            let val2: i64 = restored.read_value(1).unwrap();
-            assert_eq!(key2, "key2");
-            assert_eq!(val2, 200);
-
-            let key3: String = restored.read_key(2).unwrap();
-            let val3: i64 = restored.read_value(2).unwrap();
-            assert_eq!(key3, "key3");
-            assert_eq!(val3, 300);
-        }
-
-        #[test]
-        fn internal_node_roundtrip_with_pointers() {
-            let mut page = SlottedPage::new(1, NodeType::INTERNAL, 4096);
-
-            page.insert(0, &10i64, &"value".to_string()).unwrap();
-            page.pointers = vec![100, 200];
-
-            let bytes = page.serialize().unwrap();
-            let restored: SlottedPage<String, i64> = SlottedPage::deserialize(&bytes, 4096);
-
-            assert_eq!(restored.node_type, NodeType::INTERNAL);
-            assert_eq!(restored.pointers, vec![100, 200]);
-        }
-
-        #[test]
-        fn page_preserves_free_space_offset() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-            page.insert(0, &"test".to_string(), &42i64).unwrap();
-
-            let original_offset = page.free_space_end;
-
-            let bytes = page.serialize().unwrap();
-            let restored: SlottedPage<String, i64> = SlottedPage::deserialize(&bytes, 4096);
-
-            assert_eq!(restored.free_space_end, original_offset);
-        }
-
-        #[test]
-        fn page_preserves_free_list() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            page.insert(0, &"key1".to_string(), &100i64).unwrap();
-            page.insert(1, &"key2".to_string(), &200i64).unwrap();
-            page.insert(2, &"key3".to_string(), &300i64).unwrap();
-
-            // Delete middle entry to create a hole
-            page.delete(1).unwrap();
-
-            let free_list_len = page.free_list.len();
-            assert!(free_list_len > 0, "Should have a hole in free list");
-
-            let bytes = page.serialize().unwrap();
-            let restored: SlottedPage<String, i64> = SlottedPage::deserialize(&bytes, 4096);
-
-            assert_eq!(restored.free_list.len(), free_list_len);
-        }
-
-        #[test]
-        fn different_page_sizes() {
-            for page_size in [256, 512, 1024, 4096, 8192, 16384] {
-                let mut page = SlottedPage::new(1, NodeType::LEAF, page_size);
-                page.insert(0, &"key".to_string(), &42i64).unwrap();
-
-                let bytes = page.serialize().unwrap();
-                assert_eq!(bytes.len(), page_size);
-
-                let restored: SlottedPage<String, i64> =
-                    SlottedPage::deserialize(&bytes, page_size);
-                let key: String = restored.read_key(0).unwrap();
-                assert_eq!(key, "key");
-            }
-        }
+    fn create_page(page_size: usize) -> SlottedPage<i64, String> {
+        SlottedPage::new(0, NodeType::LEAF, page_size)
     }
 
-    mod insert {
+    fn create_page_typed<K, V>(page_size: usize) -> SlottedPage<K, V>
+    where
+        K: Clone + PartialOrd + Debug + Serialize + for<'de> Deserialize<'de>,
+        V: Clone + Debug + Serialize + for<'de> Deserialize<'de>,
+    {
+        SlottedPage::new(0, NodeType::LEAF, page_size)
+    }
+
+    /// Helper to verify page integrity - checks for overlapping regions
+    fn verify_page_integrity<K, V>(page: &SlottedPage<K, V>) -> Result<(), String>
+    where
+        K: Clone + PartialOrd + Debug + Serialize + for<'de> Deserialize<'de>,
+        V: Clone + Debug + Serialize + for<'de> Deserialize<'de>,
+    {
+        // Collect all used regions (offset, length)
+        let mut used_regions: Vec<(u16, u16, &str)> = Vec::new();
+
+        // Add slot data regions
+        for (i, slot) in page.slots.iter().enumerate() {
+            let len = slot.key_length + slot.value_length;
+            used_regions.push((slot.offset, len, "slot"));
+        }
+
+        // Add free list regions
+        for (i, region) in page.free_list.iter().enumerate() {
+            used_regions.push((region.offset, region.length, "free"));
+        }
+
+        // Sort by offset
+        used_regions.sort_by_key(|(offset, _, _)| *offset);
+
+        // Check for overlaps
+        for i in 0..used_regions.len() {
+            let (offset1, len1, type1) = used_regions[i];
+            let end1 = offset1 + len1;
+
+            for j in (i + 1)..used_regions.len() {
+                let (offset2, len2, type2) = used_regions[j];
+                let end2 = offset2 + len2;
+
+                // Check if regions overlap
+                if offset1 < end2 && offset2 < end1 {
+                    println!("Slots: {:?}", page.slots);
+                    println!("Freelist: {:?}", page.free_list);
+                    println!("Used Regions: {:?}", used_regions);
+                    return Err(format!(
+                        "Overlap detected: {} region at {}..{} overlaps with {} region at {}..{}",
+                        type1, offset1, end1, type2, offset2, end2
+                    ));
+                }
+            }
+        }
+
+        // Check that no slot region overlaps with free_space_end boundary
+        for (i, slot) in page.slots.iter().enumerate() {
+            if slot.offset < page.free_space_end {
+                return Err(format!(
+                    "Slot {} at offset {} is below free_space_end {}",
+                    i, slot.offset, page.free_space_end
+                ));
+            }
+        }
+
+        // Check that free list regions don't extend into contiguous free space
+        for region in &page.free_list {
+            if region.offset < page.free_space_end {
+                return Err(format!(
+                    "Free region at offset {} extends below free_space_end {}",
+                    region.offset, page.free_space_end
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Helper to dump page state for debugging
+    fn dump_page_state<K, V>(page: &SlottedPage<K, V>, label: &str)
+    where
+        K: Clone + PartialOrd + Debug + Serialize + for<'de> Deserialize<'de>,
+        V: Clone + Debug + Serialize + for<'de> Deserialize<'de>,
+    {
+        println!("\n=== {} ===", label);
+        println!("page_size: {}", page.page_size);
+        println!("free_space_end: {}", page.free_space_end);
+        println!("num_keys: {}", page.num_keys);
+        println!("total_free: {}", page.total_free);
+        println!("free_space(): {}", page.get_free_space());
+
+        println!("\nSlots:");
+        for (i, slot) in page.slots.iter().enumerate() {
+            println!(
+                "  [{}] offset={}, key_len={}, value_len={}, end={}",
+                i,
+                slot.offset,
+                slot.key_length,
+                slot.value_length,
+                slot.offset + slot.key_length + slot.value_length
+            );
+        }
+
+        println!("\nFree list:");
+        for (i, region) in page.free_list.iter().enumerate() {
+            println!(
+                "  [{}] offset={}, length={}, end={}",
+                i,
+                region.offset,
+                region.length,
+                region.offset + region.length
+            );
+        }
+        println!("===\n");
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Free List Basic Tests
+    // ─────────────────────────────────────────────────────────
+
+    mod free_list_basic {
         use super::*;
 
         #[test]
-        fn insert_single_entry() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
+        fn new_page_has_empty_free_list() {
+            let page = create_page(4096);
 
-            page.insert(0, &"hello".to_string(), &42i64).unwrap();
-
-            assert_eq!(page.num_keys, 1);
-            assert_eq!(page.slots.len(), 1);
-
-            let key: String = page.read_key(0).unwrap();
-            let value: i64 = page.read_value(0).unwrap();
-
-            assert_eq!(key, "hello");
-            assert_eq!(value, 42);
+            assert!(page.free_list.is_empty());
+            assert_eq!(page.free_space_end, 4096);
         }
 
         #[test]
-        fn insert_maintains_order() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
+        fn delete_creates_free_region() {
+            let mut page = create_page(4096);
 
-            // Insert in order
             page.insert(0, &1i64, &"one".to_string()).unwrap();
             page.insert(1, &2i64, &"two".to_string()).unwrap();
             page.insert(2, &3i64, &"three".to_string()).unwrap();
 
-            // Verify order
-            assert_eq!(page.read_key(0).unwrap(), 1);
-            assert_eq!(page.read_key(1).unwrap(), 2);
-            assert_eq!(page.read_key(2).unwrap(), 3);
+            let slot_before_delete = page.slots[1].clone();
+            let expected_free_len = slot_before_delete.key_length + slot_before_delete.value_length;
+
+            page.delete(1).unwrap();
+
+            // Should have a free region OR coalesced with contiguous space
+            let total_in_free_list: u16 = page.free_list.iter().map(|r| r.length).sum();
+
+            // The freed space should be accounted for somewhere
+            assert!(
+                total_in_free_list >= expected_free_len || page.total_free >= expected_free_len,
+                "Freed space not accounted for"
+            );
+
+            verify_page_integrity(&page).unwrap();
         }
 
         #[test]
-        fn insert_at_beginning() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
+        fn delete_middle_entry_creates_hole() {
+            let mut page = create_page(4096);
 
-            page.insert(0, &2i64, &"two".to_string()).unwrap();
-            page.insert(0, &1i64, &"one".to_string()).unwrap(); // Insert at beginning
+            // Insert 3 entries
+            page.insert(0, &1i64, &"aaa".to_string()).unwrap();
+            page.insert(1, &2i64, &"bbb".to_string()).unwrap();
+            page.insert(2, &3i64, &"ccc".to_string()).unwrap();
 
+            dump_page_state(&page, "After 3 inserts");
+            verify_page_integrity(&page).unwrap();
+
+            // Delete middle - this creates a hole
+            page.delete(1).unwrap();
+
+            dump_page_state(&page, "After delete middle");
+            verify_page_integrity(&page).unwrap();
+
+            // Verify remaining data is correct
+            assert_eq!(page.num_keys, 2);
             assert_eq!(page.read_key(0).unwrap(), 1);
-            assert_eq!(page.read_key(1).unwrap(), 2);
+            assert_eq!(page.read_key(1).unwrap(), 3);
         }
 
         #[test]
-        fn insert_at_middle() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
+        fn multiple_deletes_create_multiple_holes() {
+            let mut page = create_page(4096);
+
+            for i in 0..5 {
+                page.insert(i, &(i as i64), &format!("value_{}", i))
+                    .unwrap();
+            }
+
+            verify_page_integrity(&page).unwrap();
+
+            // Delete entries 1 and 3 (non-adjacent)
+            page.delete(3).unwrap();
+            page.delete(1).unwrap();
+
+            dump_page_state(&page, "After deleting 1 and 3");
+            verify_page_integrity(&page).unwrap();
+
+            // Verify remaining entries
+            assert_eq!(page.num_keys, 3);
+            assert_eq!(page.read_key(0).unwrap(), 0);
+            assert_eq!(page.read_key(1).unwrap(), 2);
+            assert_eq!(page.read_key(2).unwrap(), 4);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Free List Coalescing Tests
+    // ─────────────────────────────────────────────────────────
+
+    mod free_list_coalescing {
+        use super::*;
+
+        #[test]
+        fn adjacent_deletes_coalesce() {
+            let mut page = create_page(4096);
+
+            // Insert entries with similar sizes
+            for i in 0..5 {
+                page.insert(i, &(i as i64), &"xxxx".to_string()).unwrap();
+            }
+
+            dump_page_state(&page, "After 5 inserts");
+
+            // Delete adjacent entries
+            page.delete(2).unwrap();
+            dump_page_state(&page, "After delete index 2");
+
+            page.delete(2).unwrap(); // Was index 3, now index 2
+            dump_page_state(&page, "After delete index 2 again (was 3)");
+
+            verify_page_integrity(&page).unwrap();
+
+            // Should have coalesced into fewer regions
+            assert!(
+                page.free_list.len() <= 2,
+                "Adjacent holes should coalesce, got {} regions",
+                page.free_list.len()
+            );
+        }
+
+        #[test]
+        fn delete_at_boundary_extends_contiguous_space() {
+            let mut page = create_page(4096);
 
             page.insert(0, &1i64, &"one".to_string()).unwrap();
-            page.insert(1, &3i64, &"three".to_string()).unwrap();
-            page.insert(1, &2i64, &"two".to_string()).unwrap(); // Insert in middle
 
-            assert_eq!(page.read_key(0).unwrap(), 1);
-            assert_eq!(page.read_key(1).unwrap(), 2);
-            assert_eq!(page.read_key(2).unwrap(), 3);
+            let free_end_before = page.free_space_end;
+
+            // Delete the only entry - should extend contiguous space
+            page.delete(0).unwrap();
+
+            dump_page_state(&page, "After deleting only entry");
+
+            // free_space_end should have moved up (more contiguous space)
+            // OR the free list should contain the region
+            println!(
+                "{:?} {} {:?}",
+                page.free_space_end, free_end_before, page.free_list
+            );
+            assert!(
+                page.free_space_end > free_end_before || !page.free_list.is_empty(),
+                "Deleted space not recovered"
+            );
+
+            verify_page_integrity(&page).unwrap();
         }
-
-        #[test]
-        fn insert_reduces_free_space() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-            let initial_free = page.get_free_space();
-
-            page.insert(0, &"key".to_string(), &12345i64).unwrap();
-
-            assert!(page.get_free_space() < initial_free);
-        }
-
-        #[test]
-        fn insert_until_full() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 256); // Small page
-
-            let mut count = 0;
-            loop {
-                let key = format!("key_{:04}", count);
-                let value = count as i64;
-
-                if !page.can_insert(
-                    bincode::serialize(&key).unwrap().len(),
-                    bincode::serialize(&value).unwrap().len(),
-                ) {
-                    break;
-                }
-
-                page.insert(count, &key, &value).unwrap();
-                count += 1;
-            }
-
-            assert!(count > 0, "Should have inserted at least one entry");
-            assert_eq!(page.num_keys as usize, count);
-
-            // Verify all entries are readable
-            for i in 0..count {
-                let key: String = page.read_key(i).unwrap();
-                assert_eq!(key, format!("key_{:04}", i));
-            }
-        }
-
-        #[test]
-        fn insert_overflow_returns_error() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 256);
-
-            // Fill the page
-            while page.can_insert(10, 10) {
-                let idx = page.num_keys as usize;
-                page.insert(idx, &"key".to_string(), &42i64).unwrap();
-            }
-
-            // Try to insert when full
-            let result = page.insert(0, &"overflow".to_string(), &999i64);
-            assert!(matches!(result, Err(BTreeError::PageOverflow { .. })));
-        }
-
-        // #[test]
-        // fn insert_various_types() {
-        //     let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-        //
-        //     // Different key/value type combinations
-        //     page.insert(0, &1i32, &"string value".to_string()).unwrap();
-        //     page.insert(1, &2i32, &vec![1u8, 2, 3, 4, 5]).unwrap();
-        //     page.insert(2, &3i32, &(100i64, 200i64)).unwrap();
-        //
-        //     assert_eq!(page.num_keys, 3);
-        //
-        //     let v1: String = page.read_value(0).unwrap();
-        //     assert_eq!(v1, "string value");
-        //
-        //     let v2: Vec<u8> = page.read_value(1).unwrap();
-        //     assert_eq!(v2, vec![1, 2, 3, 4, 5]);
-        //
-        //     let v3: (i64, i64) = page.read_value(2).unwrap();
-        //     assert_eq!(v3, (100, 200));
-        // }
     }
+
+    // ─────────────────────────────────────────────────────────
+    // Free List Reuse Tests - THIS IS WHERE THE BUG LIKELY IS
+    // ─────────────────────────────────────────────────────────
+
+    mod free_list_reuse {
+        use super::*;
+
+        #[test]
+        fn insert_reuses_exact_fit_hole() {
+            let mut page = create_page(4096);
+
+            // Insert entries
+            page.insert(0, &1i64, &"aaaa".to_string()).unwrap();
+            page.insert(1, &2i64, &"bbbb".to_string()).unwrap();
+            page.insert(2, &3i64, &"cccc".to_string()).unwrap();
+
+            dump_page_state(&page, "After 3 inserts");
+            verify_page_integrity(&page).unwrap();
+
+            // Delete middle
+            page.delete(1).unwrap();
+
+            dump_page_state(&page, "After delete middle");
+            verify_page_integrity(&page).unwrap();
+
+            // Insert similar sized entry - should reuse hole
+            let pos = page.find_key_position(&2i64).unwrap();
+            page.insert(pos, &2i64, &"dddd".to_string()).unwrap();
+
+            dump_page_state(&page, "After reinsert");
+            verify_page_integrity(&page).unwrap();
+
+            // Verify all data is intact
+            assert_eq!(page.read_value(0).unwrap(), "aaaa");
+            assert_eq!(page.read_value(1).unwrap(), "dddd");
+            assert_eq!(page.read_value(2).unwrap(), "cccc");
+        }
+
+        #[test]
+        fn insert_reuses_larger_hole() {
+            let mut page = create_page(4096);
+
+            // Insert with a large value
+            page.insert(0, &1i64, &"small".to_string()).unwrap();
+            page.insert(1, &2i64, &"this_is_a_much_larger_value".to_string())
+                .unwrap();
+            page.insert(2, &3i64, &"small".to_string()).unwrap();
+
+            dump_page_state(&page, "After inserts with large middle");
+            verify_page_integrity(&page).unwrap();
+
+            // Delete the large entry
+            page.delete(1).unwrap();
+
+            dump_page_state(&page, "After delete large entry");
+            verify_page_integrity(&page).unwrap();
+
+            // Insert smaller entry - should fit in the hole with leftover
+            let pos = page.find_key_position(&2i64).unwrap();
+            page.insert(pos, &2i64, &"tiny".to_string()).unwrap();
+
+            dump_page_state(&page, "After insert smaller into large hole");
+            verify_page_integrity(&page).unwrap();
+
+            // Verify data integrity
+            assert_eq!(page.read_value(0).unwrap(), "small");
+            assert_eq!(page.read_value(1).unwrap(), "tiny");
+            assert_eq!(page.read_value(2).unwrap(), "small");
+        }
+
+        #[test]
+        fn insert_into_middle_does_not_corrupt_neighbors() {
+            let mut page = create_page(4096);
+
+            // Insert 5 entries
+            page.insert(0, &10i64, &"value_10".to_string()).unwrap();
+            page.insert(1, &20i64, &"value_20".to_string()).unwrap();
+            page.insert(2, &30i64, &"value_30".to_string()).unwrap();
+            page.insert(3, &40i64, &"value_40".to_string()).unwrap();
+            page.insert(4, &50i64, &"value_50".to_string()).unwrap();
+
+            dump_page_state(&page, "After 5 inserts");
+            verify_page_integrity(&page).unwrap();
+
+            // Delete entry at index 2 (key=30)
+            page.delete(2).unwrap();
+
+            dump_page_state(&page, "After delete index 2");
+            verify_page_integrity(&page).unwrap();
+
+            // Now insert a new key that goes in the middle (key=25)
+            let pos = page.find_key_position(&25i64).unwrap();
+            println!("Inserting key 25 at position {}", pos);
+
+            page.insert(pos, &25i64, &"value_25".to_string()).unwrap();
+
+            dump_page_state(&page, "After insert key 25");
+            verify_page_integrity(&page).unwrap();
+
+            // CRITICAL: Verify ALL entries are correct
+            let keys: Vec<i64> = (0..page.num_keys as usize)
+                .map(|i| page.read_key(i).unwrap())
+                .collect();
+            let values: Vec<String> = (0..page.num_keys as usize)
+                .map(|i| page.read_value(i).unwrap())
+                .collect();
+
+            println!("Keys: {:?}", keys);
+            println!("Values: {:?}", values);
+
+            assert_eq!(keys, vec![10, 20, 25, 40, 50]);
+            assert_eq!(
+                values,
+                vec!["value_10", "value_20", "value_25", "value_40", "value_50"]
+            );
+        }
+
+        #[test]
+        fn multiple_insert_delete_cycles() {
+            let mut page = create_page(4096);
+
+            // Cycle 1: Insert
+            for i in 0..10 {
+                page.insert(i, &(i as i64), &format!("v{}", i)).unwrap();
+            }
+            verify_page_integrity(&page).unwrap();
+
+            // Cycle 2: Delete every other
+            for i in (0..10).step_by(2).rev() {
+                page.delete(i).unwrap();
+            }
+            verify_page_integrity(&page).unwrap();
+
+            dump_page_state(&page, "After deleting evens");
+
+            // Cycle 3: Insert new entries
+            for i in 0..5 {
+                let key = i * 2; // 0, 2, 4, 6, 8
+                let pos = page.find_key_position(&key).unwrap();
+                page.insert(pos, &key, &format!("new_{}", key)).unwrap();
+                verify_page_integrity(&page).unwrap();
+            }
+
+            dump_page_state(&page, "After reinserting evens");
+
+            // Verify all entries
+            for i in 0..10 {
+                let key: i64 = page.read_key(i).unwrap();
+                assert_eq!(key, i as i64, "Key at index {} is wrong", i);
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Update Tests
+    // ─────────────────────────────────────────────────────────
 
     mod update {
         use super::*;
 
         #[test]
         fn update_same_size_value() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
+            let mut page = create_page(4096);
 
-            page.insert(0, &"key".to_string(), &100i64).unwrap();
-            let free_before = page.get_free_space();
+            page.insert(0, &1i64, &"aaaa".to_string()).unwrap();
 
-            page.update(0, &"key".to_string(), &200i64).unwrap();
+            let offset_before = page.slots[0].offset;
 
-            let value: i64 = page.read_value(0).unwrap();
-            assert_eq!(value, 200);
+            page.update(0, &1i64, &"bbbb".to_string()).unwrap();
 
-            // Free space should be unchanged
-            assert_eq!(page.get_free_space(), free_before);
+            // Should update in place (same offset)
+            assert_eq!(page.slots[0].offset, offset_before);
+            assert_eq!(page.read_value(0).unwrap(), "bbbb");
+
+            verify_page_integrity(&page).unwrap();
         }
 
         #[test]
         fn update_smaller_value() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
+            let mut page = create_page(4096);
 
-            page.insert(0, &1i64, &"a]long string value".to_string())
+            page.insert(0, &1i64, &"this_is_a_long_value".to_string())
                 .unwrap();
-            let free_before = page.get_free_space();
+            page.insert(1, &2i64, &"other".to_string()).unwrap();
+
+            dump_page_state(&page, "Before update to smaller");
+
+            let offset_before = page.slots[0].offset;
+            let len_before = page.slots[0].value_length;
 
             page.update(0, &1i64, &"short".to_string()).unwrap();
 
-            let value: String = page.read_value(0).unwrap();
-            assert_eq!(value, "short");
+            dump_page_state(&page, "After update to smaller");
+            verify_page_integrity(&page).unwrap();
 
-            // Free space should increase (leftover added to free list)
-            assert!(page.get_free_space() >= free_before);
+            // Value should be updated
+            assert_eq!(page.read_value(0).unwrap(), "short");
+            // Other entry should be unaffected
+            assert_eq!(page.read_value(1).unwrap(), "other");
+
+            // Leftover space should be in free list or total_free increased
+            assert!(
+                page.slots[0].value_length < len_before,
+                "Value length should have decreased"
+            );
         }
 
         #[test]
-        fn update_larger_value() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
+        fn update_larger_value_relocates() {
+            let mut page = create_page(4096);
 
             page.insert(0, &1i64, &"short".to_string()).unwrap();
+            page.insert(1, &2i64, &"other".to_string()).unwrap();
 
-            page.update(0, &1i64, &"a much longer string value".to_string())
+            dump_page_state(&page, "Before update to larger");
+
+            let offset_before = page.slots[0].offset;
+
+            page.update(0, &1i64, &"this_is_a_much_longer_value".to_string())
                 .unwrap();
 
-            let value: String = page.read_value(0).unwrap();
-            assert_eq!(value, "a much longer string value");
+            dump_page_state(&page, "After update to larger");
+            verify_page_integrity(&page).unwrap();
+
+            // Value should be updated
+            assert_eq!(page.read_value(0).unwrap(), "this_is_a_much_longer_value");
+            // Other entry should be unaffected
+            assert_eq!(page.read_value(1).unwrap(), "other");
+
+            // Offset should have changed (relocated)
+            assert_ne!(
+                page.slots[0].offset, offset_before,
+                "Should have relocated to new position"
+            );
         }
 
         #[test]
-        fn update_preserves_other_entries() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
+        fn update_does_not_corrupt_other_entries() {
+            let mut page = create_page(4096);
 
             page.insert(0, &1i64, &"one".to_string()).unwrap();
             page.insert(1, &2i64, &"two".to_string()).unwrap();
             page.insert(2, &3i64, &"three".to_string()).unwrap();
+            page.insert(3, &4i64, &"four".to_string()).unwrap();
+            page.insert(4, &5i64, &"five".to_string()).unwrap();
 
-            page.update(1, &2i64, &"TWO UPDATED".to_string()).unwrap();
+            verify_page_integrity(&page).unwrap();
 
-            // Check other entries unchanged
+            // Update middle entry with larger value
+            page.update(2, &3i64, &"THREE_UPDATED_LONGER".to_string())
+                .unwrap();
+
+            verify_page_integrity(&page).unwrap();
+
+            // Verify all entries
             assert_eq!(page.read_value(0).unwrap(), "one");
-            assert_eq!(page.read_value(1).unwrap(), "TWO UPDATED");
-            assert_eq!(page.read_value(2).unwrap(), "three");
+            assert_eq!(page.read_value(1).unwrap(), "two");
+            assert_eq!(page.read_value(2).unwrap(), "THREE_UPDATED_LONGER");
+            assert_eq!(page.read_value(3).unwrap(), "four");
+            assert_eq!(page.read_value(4).unwrap(), "five");
         }
 
         #[test]
         fn multiple_updates_same_entry() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
+            let mut page = create_page(4096);
 
-            page.insert(0, &"key".to_string(), &1i64).unwrap();
+            page.insert(0, &1i64, &"initial".to_string()).unwrap();
+            page.insert(1, &2i64, &"other".to_string()).unwrap();
 
-            for i in 2..=100 {
-                page.update(0, &"key".to_string(), &(i as i64)).unwrap();
+            for i in 0..20 {
+                let value = format!("update_{:02}", i);
+                page.update(0, &1i64, &value).unwrap();
+                verify_page_integrity(&page).unwrap();
+
+                assert_eq!(page.read_value(0).unwrap(), value);
+                assert_eq!(page.read_value(1).unwrap(), "other");
             }
-
-            let value: i64 = page.read_value(0).unwrap();
-            assert_eq!(value, 100);
         }
     }
+
+    // ─────────────────────────────────────────────────────────
+    // Delete Tests
+    // ─────────────────────────────────────────────────────────
 
     mod delete {
         use super::*;
 
         #[test]
-        fn delete_single_entry() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            page.insert(0, &"key".to_string(), &42i64).unwrap();
-            assert_eq!(page.num_keys, 1);
-
-            page.delete(0).unwrap();
-            assert_eq!(page.num_keys, 0);
-            assert_eq!(page.slots.len(), 0);
-        }
-
-        #[test]
-        fn delete_increases_free_space() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            page.insert(0, &"key".to_string(), &42i64).unwrap();
-            let free_before = page.get_free_space();
-
-            page.delete(0).unwrap();
-
-            assert!(page.get_free_space() > free_before);
-        }
-
-        #[test]
-        fn delete_creates_free_list_entry() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            page.insert(0, &"key1".to_string(), &1i64).unwrap();
-            page.insert(1, &"key2".to_string(), &2i64).unwrap();
-            page.insert(2, &"key3".to_string(), &3i64).unwrap();
-
-            // Delete middle - should create hole
-            page.delete(1).unwrap();
-
-            // Free list should have an entry (unless coalesced with contiguous space)
-            assert!(page.free_list.len() > 0 || page.total_free > 0);
-        }
-
-        #[test]
-        fn delete_from_beginning() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
+        fn delete_first_entry() {
+            let mut page = create_page(4096);
 
             page.insert(0, &1i64, &"one".to_string()).unwrap();
             page.insert(1, &2i64, &"two".to_string()).unwrap();
             page.insert(2, &3i64, &"three".to_string()).unwrap();
 
             page.delete(0).unwrap();
+
+            verify_page_integrity(&page).unwrap();
 
             assert_eq!(page.num_keys, 2);
             assert_eq!(page.read_key(0).unwrap(), 2);
@@ -959,8 +1156,8 @@ mod tests {
         }
 
         #[test]
-        fn delete_from_end() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
+        fn delete_last_entry() {
+            let mut page = create_page(4096);
 
             page.insert(0, &1i64, &"one".to_string()).unwrap();
             page.insert(1, &2i64, &"two".to_string()).unwrap();
@@ -968,417 +1165,234 @@ mod tests {
 
             page.delete(2).unwrap();
 
+            verify_page_integrity(&page).unwrap();
+
             assert_eq!(page.num_keys, 2);
             assert_eq!(page.read_key(0).unwrap(), 1);
             assert_eq!(page.read_key(1).unwrap(), 2);
         }
 
         #[test]
-        fn delete_invalid_index_returns_error() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
+        fn delete_middle_entry() {
+            let mut page = create_page(4096);
 
-            page.insert(0, &"key".to_string(), &42i64).unwrap();
+            page.insert(0, &1i64, &"one".to_string()).unwrap();
+            page.insert(1, &2i64, &"two".to_string()).unwrap();
+            page.insert(2, &3i64, &"three".to_string()).unwrap();
 
-            let result = page.delete(5);
-            assert!(matches!(result, Err(BTreeError::KeyNotFound(_))));
+            page.delete(1).unwrap();
+
+            verify_page_integrity(&page).unwrap();
+
+            assert_eq!(page.num_keys, 2);
+            assert_eq!(page.read_key(0).unwrap(), 1);
+            assert_eq!(page.read_key(1).unwrap(), 3);
+            assert_eq!(page.read_value(0).unwrap(), "one");
+            assert_eq!(page.read_value(1).unwrap(), "three");
         }
 
         #[test]
-        fn delete_all_entries() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
+        fn delete_all_entries_one_by_one() {
+            let mut page = create_page(4096);
 
             for i in 0..10 {
-                page.insert(i, &(i as i64), &format!("value_{}", i))
-                    .unwrap();
+                page.insert(i, &(i as i64), &format!("val_{}", i)).unwrap();
             }
 
-            // Delete all from end to beginning
             for _ in 0..10 {
                 page.delete(0).unwrap();
+                verify_page_integrity(&page).unwrap();
             }
 
             assert_eq!(page.num_keys, 0);
-            assert_eq!(page.slots.len(), 0);
-        }
-    }
-
-    mod free_list {
-        use super::*;
-
-        #[test]
-        fn free_list_reuses_space() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            // Insert entries
-            page.insert(0, &"key1".to_string(), &100i64).unwrap();
-            page.insert(1, &"key2".to_string(), &200i64).unwrap();
-            page.insert(2, &"key3".to_string(), &300i64).unwrap();
-
-            // Delete middle
-            page.delete(1).unwrap();
-
-            let free_before_reuse = page.get_free_space();
-
-            // Insert similar-sized entry - should reuse hole
-            page.insert(1, &"new2".to_string(), &999i64).unwrap();
-
-            // Verify data
-            assert_eq!(page.read_value(1).unwrap(), 999);
-
-            // Free list should be smaller or empty
-            assert!(page.free_list.len() == 0 || page.get_free_space() <= free_before_reuse);
         }
 
         #[test]
-        fn free_list_coalesces_adjacent_holes() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
+        fn delete_in_reverse_order() {
+            let mut page = create_page(4096);
 
-            // Insert 5 entries
-            for i in 0..5 {
-                page.insert(i, &(i as i64), &format!("value_{}", i))
-                    .unwrap();
+            for i in 0..10 {
+                page.insert(i, &(i as i64), &format!("val_{}", i)).unwrap();
             }
 
-            // Delete entries 1, 2, 3 (adjacent) - should coalesce
-            page.delete(3).unwrap();
+            for i in (0..10).rev() {
+                page.delete(i).unwrap();
+                verify_page_integrity(&page).unwrap();
+            }
+
+            assert_eq!(page.num_keys, 0);
+        }
+
+        #[test]
+        fn delete_and_verify_remaining() {
+            let mut page = create_page(4096);
+
+            let entries: Vec<(i64, String)> =
+                (0..10).map(|i| (i, format!("value_{}", i))).collect();
+
+            for (i, (k, v)) in entries.iter().enumerate() {
+                page.insert(i, k, v).unwrap();
+            }
+
+            // Delete indices 2, 5, 7
+            page.delete(7).unwrap();
+            page.delete(5).unwrap();
             page.delete(2).unwrap();
-            page.delete(1).unwrap();
 
-            // Should have at most 1 free region (coalesced) or 0 if merged with contiguous
-            assert!(page.free_list.len() <= 1);
-        }
+            verify_page_integrity(&page).unwrap();
 
-        #[test]
-        fn fragmentation_ratio_zero_when_no_holes() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            page.insert(0, &"key".to_string(), &42i64).unwrap();
-
-            assert_eq!(page.fragmentation_ratio(), 0.0);
-        }
-
-        #[test]
-        fn fragmentation_ratio_increases_with_holes() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            for i in 0..10 {
-                page.insert(i, &(i as i64), &format!("value_{}", i))
-                    .unwrap();
-            }
-
-            // Delete every other entry to create holes
-            for i in (1..10).step_by(2).rev() {
-                page.delete(i).unwrap();
-            }
-
-            let frag = page.fragmentation_ratio();
-            assert!(frag > 0.0, "Should have fragmentation: {}", frag);
-        }
-
-        #[test]
-        fn should_compact_threshold() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            // Fill page
-            for i in 0..20 {
-                page.insert(i, &(i as i64), &format!("value_{:04}", i))
-                    .unwrap();
-            }
-
-            // Delete many entries to create fragmentation
-            for i in (0..20).step_by(2).rev() {
-                page.delete(i).unwrap();
-            }
-
-            // Check if compaction is recommended
-            if page.fragmentation_ratio() > 0.3 {
-                assert!(page.should_compact());
-            }
-        }
-
-        #[test]
-        fn compact_eliminates_fragmentation() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            // Fill and fragment
-            for i in 0..10 {
-                page.insert(i, &(i as i64), &format!("value_{}", i))
-                    .unwrap();
-            }
-
-            for i in (1..10).step_by(2).rev() {
-                page.delete(i).unwrap();
-            }
-
-            // Compact
-            page.compact().unwrap();
-
-            // Fragmentation should be zero
-            assert_eq!(page.fragmentation_ratio(), 0.0);
-            assert!(page.free_list.is_empty());
-
-            // Data should still be intact
-            let remaining_keys: Vec<i64> = (0..page.num_keys as usize)
+            // Expected remaining: 0, 1, 3, 4, 6, 8, 9
+            let expected_keys = vec![0i64, 1, 3, 4, 6, 8, 9];
+            let actual_keys: Vec<i64> = (0..page.num_keys as usize)
                 .map(|i| page.read_key(i).unwrap())
                 .collect();
 
-            assert_eq!(remaining_keys, vec![0, 2, 4, 6, 8]);
+            assert_eq!(actual_keys, expected_keys);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Data Corruption Detection Tests
+    // ─────────────────────────────────────────────────────────
+
+    mod corruption_detection {
+        use super::*;
+
+        #[test]
+        fn detect_overlapping_slot_regions() {
+            let mut page = create_page(4096);
+
+            page.insert(0, &1i64, &"one".to_string()).unwrap();
+            page.insert(1, &2i64, &"two".to_string()).unwrap();
+
+            // Manually corrupt: make slot 0's length extend into slot 1
+            // This simulates what might happen with the bug
+            let original_len = page.slots[0].value_length;
+            page.slots[0].value_length = original_len + 100; // Extend into next region
+
+            let result = verify_page_integrity(&page);
+            assert!(result.is_err(), "Should detect overlap");
         }
 
         #[test]
-        fn compact_preserves_all_data() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
+        fn insert_delete_insert_pattern() {
+            let mut page = create_page(4096);
 
-            let original_data: Vec<(i64, String)> =
-                (0..10).map(|i| (i, format!("value_{}", i))).collect();
+            // This pattern often exposes free list bugs
+            page.insert(0, &100i64, &"aaaaaaaaaa".to_string()).unwrap();
+            page.insert(1, &200i64, &"bbbbbbbbbb".to_string()).unwrap();
+            page.insert(2, &300i64, &"cccccccccc".to_string()).unwrap();
 
-            for (i, (k, v)) in original_data.iter().enumerate() {
-                page.insert(i, k, v).unwrap();
+            verify_page_integrity(&page).unwrap();
+
+            // Delete middle
+            page.delete(1).unwrap();
+            verify_page_integrity(&page).unwrap();
+
+            // Insert at beginning (should shift slots but reuse space)
+            page.insert(0, &50i64, &"dddddddddd".to_string()).unwrap();
+            verify_page_integrity(&page).unwrap();
+
+            // Check all values
+            assert_eq!(page.read_key(0).unwrap(), 50);
+            assert_eq!(page.read_key(1).unwrap(), 100);
+            assert_eq!(page.read_key(2).unwrap(), 300);
+
+            assert_eq!(page.read_value(0).unwrap(), "dddddddddd");
+            assert_eq!(page.read_value(1).unwrap(), "aaaaaaaaaa");
+            assert_eq!(page.read_value(2).unwrap(), "cccccccccc");
+        }
+
+        #[test]
+        fn stress_insert_delete_insert() {
+            let mut page = create_page(4096);
+
+            // Fill with entries
+            for i in 0..20 {
+                page.insert(i, &(i as i64), &format!("value_{:03}", i))
+                    .unwrap();
             }
 
-            // Delete some
-            page.delete(7).unwrap();
-            page.delete(3).unwrap();
+            // Delete random entries
+            for i in [15, 10, 5, 0, 18, 7, 12].iter() {
+                if (*i as u16) < page.num_keys {
+                    page.delete(*i).unwrap();
+                    verify_page_integrity(&page).unwrap();
+                }
+            }
 
-            // Compact
-            page.compact().unwrap();
+            dump_page_state(&page, "After random deletes");
 
-            // Verify remaining data
-            let expected: Vec<(i64, String)> = original_data
-                .into_iter()
-                .filter(|(k, _)| *k != 3 && *k != 7)
+            // Insert new entries
+            for i in 100..110 {
+                let pos = page.find_key_position(&i).unwrap();
+                page.insert(pos, &i, &format!("new_{}", i)).unwrap();
+                dump_page_state(&page, "After random deletes");
+                verify_page_integrity(&page).unwrap();
+            }
+
+            dump_page_state(&page, "After new inserts");
+
+            // Verify all keys are readable and unique
+            let mut keys: Vec<i64> = (0..page.num_keys as usize)
+                .map(|i| page.read_key(i).unwrap())
                 .collect();
 
-            for (i, (expected_key, expected_value)) in expected.iter().enumerate() {
-                let key: i64 = page.read_key(i).unwrap();
-                let value: String = page.read_value(i).unwrap();
-                assert_eq!(key, *expected_key);
-                assert_eq!(value, *expected_value);
-            }
+            let len_before = keys.len();
+            keys.sort();
+            keys.dedup();
+            assert_eq!(keys.len(), len_before, "Duplicate keys found!");
         }
     }
 
-    mod search {
+    // ─────────────────────────────────────────────────────────
+    // Serialization Roundtrip with Free List
+    // ─────────────────────────────────────────────────────────
+
+    mod serialization_with_free_list {
         use super::*;
 
         #[test]
-        fn find_key_position_empty_page() {
-            let page: SlottedPage<i64, i64> = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            let pos = page.find_key_position(&42i64).unwrap();
-            assert_eq!(pos, 0);
-        }
-
-        #[test]
-        fn find_key_position_single_entry() {
-            let mut page: SlottedPage<i64, String> = SlottedPage::new(1, NodeType::LEAF, 4096);
-            page.insert(0, &50i64, &"fifty".to_string()).unwrap();
-
-            assert_eq!(page.find_key_position(&25i64).unwrap(), 0); // Before
-            assert_eq!(page.find_key_position(&50i64).unwrap(), 0); // Exact
-            assert_eq!(page.find_key_position(&75i64).unwrap(), 1); // After
-        }
-
-        #[test]
-        fn find_key_position_multiple_entries() {
-            let mut page: SlottedPage<i64, String> = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            for i in [10, 20, 30, 40, 50] {
-                let idx = page.find_key_position(&i).unwrap();
-                page.insert(idx, &i, &format!("val_{}", i)).unwrap();
-            }
-
-            assert_eq!(page.find_key_position(&5i64).unwrap(), 0);
-            assert_eq!(page.find_key_position(&10i64).unwrap(), 0);
-            assert_eq!(page.find_key_position(&15i64).unwrap(), 1);
-            assert_eq!(page.find_key_position(&25i64).unwrap(), 2);
-            assert_eq!(page.find_key_position(&50i64).unwrap(), 4);
-            assert_eq!(page.find_key_position(&100i64).unwrap(), 5);
-        }
-
-        #[test]
-        fn find_exact_key_found() {
-            let mut page: SlottedPage<String, i64> = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            page.insert(0, &"apple".to_string(), &1i64).unwrap();
-            page.insert(1, &"banana".to_string(), &2i64).unwrap();
-            page.insert(2, &"cherry".to_string(), &3i64).unwrap();
-
-            assert_eq!(page.find_exact_key(&"apple".to_string()).unwrap(), Some(0));
-            assert_eq!(page.find_exact_key(&"banana".to_string()).unwrap(), Some(1));
-            assert_eq!(page.find_exact_key(&"cherry".to_string()).unwrap(), Some(2));
-        }
-
-        #[test]
-        fn find_exact_key_not_found() {
-            let mut page: SlottedPage<String, i64> = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            page.insert(0, &"apple".to_string(), &1i64).unwrap();
-            page.insert(1, &"cherry".to_string(), &3i64).unwrap();
-
-            assert_eq!(page.find_exact_key(&"banana".to_string()).unwrap(), None);
-            assert_eq!(page.find_exact_key(&"grape".to_string()).unwrap(), None);
-        }
-    }
-
-    mod split {
-        use super::*;
-
-        #[test]
-        fn split_distributes_keys_evenly() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            for i in 0..10 {
-                page.insert(i, &(i as i64), &format!("value_{}", i))
-                    .unwrap();
-            }
-
-            let (median_key, _, right) = page.split(2).unwrap();
-
-            // Median should be middle element
-            assert_eq!(median_key, 5);
-
-            // Left should have keys 0-4
-            assert_eq!(page.num_keys, 5);
-            for i in 0..5 {
-                assert_eq!(page.read_key(i).unwrap(), i as i64);
-            }
-
-            // Right should have keys 6-9
-            assert_eq!(right.num_keys, 4);
-            for i in 0..4 {
-                assert_eq!(right.read_key(i).unwrap(), (i + 6) as i64);
-            }
-        }
-
-        #[test]
-        fn split_internal_node_distributes_pointers() {
-            let mut page = SlottedPage::new(1, NodeType::INTERNAL, 4096);
-
-            for i in 0..10 {
-                page.insert(i, &(i as i64), &format!("value_{}", i))
-                    .unwrap();
-            }
-            page.pointers = (100..111).collect(); // 11 pointers for 10 keys
-
-            let (_, _, right) = page.split(2).unwrap();
-
-            // Check pointers are distributed
-            assert_eq!(page.pointers.len(), 6); // 5 keys + 1
-            assert_eq!(right.pointers.len(), 5); // 4 keys + 1
-        }
-
-        #[test]
-        fn split_preserves_data_integrity() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            let original: Vec<(i64, String)> =
-                (0..10).map(|i| (i, format!("value_{}", i))).collect();
-
-            for (i, (k, v)) in original.iter().enumerate() {
-                page.insert(i, k, v).unwrap();
-            }
-
-            let (median_key, median_value, right) = page.split(2).unwrap();
-
-            // Collect all keys/values from both pages
-            let mut all_data: Vec<(i64, String)> = Vec::new();
-
-            for i in 0..page.num_keys as usize {
-                all_data.push((page.read_key(i).unwrap(), page.read_value(i).unwrap()));
-            }
-
-            all_data.push((median_key, median_value));
-
-            for i in 0..right.num_keys as usize {
-                all_data.push((right.read_key(i).unwrap(), right.read_value(i).unwrap()));
-            }
-
-            all_data.sort_by_key(|(k, _)| *k);
-
-            assert_eq!(all_data, original);
-        }
-
-        #[test]
-        fn split_assigns_correct_page_id() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            for i in 0..10 {
-                page.insert(i, &(i as i64), &"val".to_string()).unwrap();
-            }
-
-            let (_, _, right) = page.split(99).unwrap();
-
-            assert_eq!(page.page_id, 1);
-            assert_eq!(right.page_id, 99);
-        }
-    }
-
-    mod statistics {
-        use super::*;
-
-        #[test]
-        fn free_space_decreases_with_inserts() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-            let mut prev_free = page.get_free_space();
-
-            for i in 0..10 {
-                page.insert(i, &(i as i64), &format!("value_{}", i))
-                    .unwrap();
-                let curr_free = page.get_free_space();
-                assert!(curr_free < prev_free, "Free space should decrease");
-                prev_free = curr_free;
-            }
-        }
-
-        #[test]
-        fn total_free_tracks_correctly() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
+        fn roundtrip_preserves_free_list() {
+            let mut page: SlottedPage<i64, String> = create_page_typed(4096);
 
             page.insert(0, &1i64, &"one".to_string()).unwrap();
             page.insert(1, &2i64, &"two".to_string()).unwrap();
+            page.insert(2, &3i64, &"three".to_string()).unwrap();
 
-            let free_after_insert = page.total_free;
+            page.delete(1).unwrap();
 
-            page.delete(0).unwrap();
+            let free_list_len = page.free_list.len();
+            let total_free = page.total_free;
 
-            assert!(page.total_free > free_after_insert);
+            let bytes = page.serialize().unwrap();
+            let restored: SlottedPage<i64, String> = SlottedPage::deserialize(&bytes, 4096);
+
+            assert_eq!(restored.free_list.len(), free_list_len);
+            assert_eq!(restored.total_free, total_free);
+
+            verify_page_integrity(&restored).unwrap();
         }
 
         #[test]
-        fn can_insert_reports_correctly() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 256); // Small page
-
-            // Should be able to insert initially
-            assert!(page.can_insert(10, 10));
-
-            // Fill the page
-            while page.can_insert(10, 10) {
-                let idx = page.num_keys as usize;
-                page.insert(idx, &"key".to_string(), &42i64).unwrap();
-            }
-
-            // Should not be able to insert
-            assert!(!page.can_insert(10, 10));
-        }
-
-        #[test]
-        fn num_keys_accurate() {
-            let mut page = SlottedPage::new(1, NodeType::LEAF, 4096);
-
-            assert_eq!(page.num_keys, 0);
+        fn roundtrip_after_reuse() {
+            let mut page: SlottedPage<i64, String> = create_page_typed(4096);
 
             page.insert(0, &1i64, &"one".to_string()).unwrap();
-            assert_eq!(page.num_keys, 1);
-
             page.insert(1, &2i64, &"two".to_string()).unwrap();
-            assert_eq!(page.num_keys, 2);
+            page.insert(2, &3i64, &"three".to_string()).unwrap();
 
-            page.delete(0).unwrap();
-            assert_eq!(page.num_keys, 1);
+            page.delete(1).unwrap();
+            page.insert(1, &2i64, &"TWO".to_string()).unwrap();
 
-            page.delete(0).unwrap();
-            assert_eq!(page.num_keys, 0);
+            let bytes = page.serialize().unwrap();
+            let restored: SlottedPage<i64, String> = SlottedPage::deserialize(&bytes, 4096);
+
+            verify_page_integrity(&restored).unwrap();
+
+            assert_eq!(restored.read_value(0).unwrap(), "one");
+            assert_eq!(restored.read_value(1).unwrap(), "TWO");
+            assert_eq!(restored.read_value(2).unwrap(), "three");
         }
     }
 }

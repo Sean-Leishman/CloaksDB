@@ -34,6 +34,14 @@ impl Slot {
             value_length: value_length,
         }
     }
+
+    pub fn clone(&self) -> Self {
+        Slot {
+            offset: self.offset,
+            key_length: self.key_length,
+            value_length: self.value_length,
+        }
+    }
 }
 
 #[cfg(test)]
