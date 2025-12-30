@@ -2,6 +2,8 @@ use cloaksdb::BTree;
 use rand::Rng;
 
 fn main() {
+    env_logger::init();
+
     let index_dir = format!("out/database/index");
     std::fs::create_dir_all(&index_dir).expect("Failed to create_dir");
 
@@ -17,16 +19,9 @@ fn main() {
     let mut btree = BTree::<i64, i64>::new(file, 1024).unwrap();
     let mut rng = rand::rng();
 
-    for i in 400..1000 {
+    for i in (400..1000).rev() {
         let _: i64 = rng.random_range(0..101); // Generate a number in the range [0, 100]
-        match btree.insert(i, 100) {
-            Ok(_) => println!("Insert {} success", i),
-            Err(e) => {
-                eprintln!("Insert {} failed: {:?}", i, e);
-                panic!("Insert failed")
-            }
-        }
-        btree.print_tree();
+        btree.insert(i, 100).unwrap()
     }
     btree.print_tree();
     println!("Finished run");

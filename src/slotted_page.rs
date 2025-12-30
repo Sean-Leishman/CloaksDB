@@ -4,6 +4,7 @@ use crate::free_space::FreeSpaceRegion;
 use crate::slot::Slot;
 use crate::types::NodeType;
 use crate::{error::BTreeError, header::Header};
+use log::trace;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 
@@ -334,22 +335,22 @@ where
             Some(free_list_idx) => {
                 let region = &self.free_list[free_list_idx];
                 let remaining = region.length as usize - total_len;
-                println!("Assign from freelist: {:?} {:?}", region, remaining);
+                trace!("Assign from freelist: {:?} {:?}", region, remaining);
 
                 if remaining > 0 {
-                    println!("Init from freelist: {} {}", offset, total_len);
+                    trace!("Init from freelist: {} {}", offset, total_len);
                     self.free_list[free_list_idx] = FreeSpaceRegion {
                         offset: offset as u16 + total_len as u16,
                         length: remaining as u16,
                     };
                 } else {
-                    println!("Remove from freelist: {}", free_list_idx);
+                    trace!("Remove from freelist: {}", free_list_idx);
                     self.free_list.remove(free_list_idx);
                 }
             }
             None => {
                 // Contiguous space
-                println!("Assign from contiguous space: {}", offset);
+                trace!("Assign from contiguous space: {}", offset);
                 self.free_space_end = offset as u16;
             }
         };
@@ -602,13 +603,13 @@ mod tests {
         let mut used_regions: Vec<(u16, u16, &str)> = Vec::new();
 
         // Add slot data regions
-        for (i, slot) in page.slots.iter().enumerate() {
+        for (_, slot) in page.slots.iter().enumerate() {
             let len = slot.key_length + slot.value_length;
             used_regions.push((slot.offset, len, "slot"));
         }
 
         // Add free list regions
-        for (i, region) in page.free_list.iter().enumerate() {
+        for (_, region) in page.free_list.iter().enumerate() {
             used_regions.push((region.offset, region.length, "free"));
         }
 
@@ -626,9 +627,6 @@ mod tests {
 
                 // Check if regions overlap
                 if offset1 < end2 && offset2 < end1 {
-                    println!("Slots: {:?}", page.slots);
-                    println!("Freelist: {:?}", page.free_list);
-                    println!("Used Regions: {:?}", used_regions);
                     return Err(format!(
                         "Overlap detected: {} region at {}..{} overlaps with {} region at {}..{}",
                         type1, offset1, end1, type2, offset2, end2
@@ -1038,7 +1036,7 @@ mod tests {
 
             dump_page_state(&page, "Before update to smaller");
 
-            let offset_before = page.slots[0].offset;
+            let _ = page.slots[0].offset;
             let len_before = page.slots[0].value_length;
 
             page.update(0, &1i64, &"short".to_string()).unwrap();
@@ -1265,12 +1263,13 @@ mod tests {
             page.insert(0, &1i64, &"one".to_string()).unwrap();
             page.insert(1, &2i64, &"two".to_string()).unwrap();
 
-            // Manually corrupt: make slot 0's length extend into slot 1
+            // Manually corrupt: make slot 1's length extend into slot 0
             // This simulates what might happen with the bug
-            let original_len = page.slots[0].value_length;
-            page.slots[0].value_length = original_len + 100; // Extend into next region
+            let original_len = page.slots[1].value_length;
+            page.slots[1].value_length = original_len + 100; // Extend into next region
 
             let result = verify_page_integrity(&page);
+            dump_page_state(&page, "Detect overlapping slot regions");
             assert!(result.is_err(), "Should detect overlap");
         }
 
